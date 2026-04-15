@@ -13,6 +13,9 @@ from src.ollama import chat, build_system_prompt, MODEL, OLLAMA_URL
 from src.terminal import read_input
 
 
+_FOX_BANNER = r"(/\_/\)  🦊 Fox — A Clever and Cunning Agent Loop"
+
+
 def main():
     work_dir = tempfile.mkdtemp(prefix="fox_work_")
     storage = Storage()
@@ -36,7 +39,8 @@ def main():
         work_dir=work_dir,
     )
 
-    print(f"\033[1m🦊 Fox — {MODEL} @ {OLLAMA_URL}\033[0m")
+    print(f"\033[33;1m{_FOX_BANNER}\033[0m")
+    print(f"\033[1m  {MODEL} @ {OLLAMA_URL}\033[0m")
     print(f"   cwd:     {os.getcwd()}")
     print(f"   scratch: {work_dir}")
     print(f"   Enter → send  |  Alt+Enter → newline  |  Paste → auto-captured")

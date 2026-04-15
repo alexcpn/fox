@@ -4,6 +4,7 @@ Fox Ollama interface — chat(), TOOLS list, and system prompt builder.
 
 import os
 import time
+import threading
 import requests
 
 OLLAMA_URL   = os.environ.get("OLLAMA_URL",       "http://localhost:11434")
@@ -148,6 +149,31 @@ RULES:
 
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
+_SPINNER_FRAMES = [
+    "🦊",
+    "🦊·",
+    "🦊··",
+    "🦊···",
+    "·🦊··",
+    "··🦊·",
+    "···🦊",
+    "··🦊·",
+    "·🦊··",
+    "🦊···",
+    "🦊··",
+    "🦊·",
+]
+
+
+def _spin(stop_event: threading.Event) -> None:
+    i = 0
+    while not stop_event.is_set():
+        frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
+        print(f"\r  {frame} ", end="", flush=True)
+        i += 1
+        time.sleep(0.12)
+
+
 def chat(messages: list[dict], use_tools: bool = True, think: bool = True) -> dict:
     payload: dict = {
         "model":   MODEL,
@@ -158,9 +184,18 @@ def chat(messages: list[dict], use_tools: bool = True, think: bool = True) -> di
     if use_tools:
         payload["tools"] = TOOLS
 
+    stop = threading.Event()
+    spinner = threading.Thread(target=_spin, args=(stop,), daemon=True)
+    spinner.start()
+
     t0 = time.time()
-    resp = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=600)
+    try:
+        resp = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=600)
+    finally:
+        stop.set()
+        spinner.join()
+
     elapsed = time.time() - t0
-    print(f"  \033[90m  [{elapsed:.0f}s]\033[0m", end="", flush=True)
+    print(f"\r  \033[90m🦊 [{elapsed:.0f}s]\033[0m  ", end="", flush=True)
     resp.raise_for_status()
     return resp.json()["message"]
