@@ -133,7 +133,18 @@ class TaskStateMachine:
                 elif content:
                     self.transition(TaskState.EVALUATING, storage=storage)
                 else:
-                    self._fail("empty LLM response", storage)
+                    # Model returned nothing — nudge it once before giving up
+                    if not hasattr(self, "_empty_nudges"):
+                        self._empty_nudges = 0  # type: ignore[attr-defined]
+                    self._empty_nudges += 1  # type: ignore[attr-defined]
+                    if self._empty_nudges <= 2:
+                        messages.append({
+                            "role": "user",
+                            "content": "Please continue. Write the next tool call or provide your final answer.",
+                        })
+                        # stay in EXECUTING — will retry LLM call on next iteration
+                    else:
+                        self._fail("empty LLM response after nudges", storage)
 
             # ── TOOL_CALLING: dispatch commands ───────────────────────────
             elif self.state == TaskState.TOOL_CALLING:

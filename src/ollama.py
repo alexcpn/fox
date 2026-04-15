@@ -26,9 +26,10 @@ TOOLS = [
                 "Use this for: ls, find, grep, cat, head, tail, wc, du, git, curl, jq, awk, sed, etc. "
                 "You have full internet access via curl. Commands run in the user's cwd. "
                 "You can install Python packages with pip and run Python scripts with any library: "
-                "e.g. 'pip install python-pptx -q && python3 -c \"...\"' to create .pptx files, "
-                "'pip install pillow -q && python3 script.py' for images, etc. "
-                "NEVER say you cannot create files — use pip to install what you need."
+                "e.g. 'pip install python-pptx -q && echo OK' to install (echo OK confirms success), "
+                "then a separate run_bash call to run the script. "
+                "NEVER say you cannot create files — use pip to install what you need. "
+                "NOTE: 'pip install -q' produces no output on success — always append '&& echo OK' so you know it worked."
             ),
             "parameters": {
                 "type": "object",
