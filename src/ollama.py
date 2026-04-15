@@ -24,7 +24,11 @@ TOOLS = [
             "description": (
                 "Run a bash command and return its stdout and stderr. "
                 "Use this for: ls, find, grep, cat, head, tail, wc, du, git, curl, jq, awk, sed, etc. "
-                "You have full internet access via curl. Commands run in the user's cwd."
+                "You have full internet access via curl. Commands run in the user's cwd. "
+                "You can install Python packages with pip and run Python scripts with any library: "
+                "e.g. 'pip install python-pptx -q && python3 -c \"...\"' to create .pptx files, "
+                "'pip install pillow -q && python3 script.py' for images, etc. "
+                "NEVER say you cannot create files — use pip to install what you need."
             ),
             "parameters": {
                 "type": "object",
@@ -139,6 +143,7 @@ Scratch directory: {work_dir}
 RULES:
 - Internet access via curl in run_bash. Never say you cannot fetch data.
 - For data processing use run_python with stdlib only (csv, re, json, collections). No pandas/numpy.
+- To use third-party libraries (e.g. python-pptx, pillow, openpyxl), install via run_bash: 'pip install <pkg> -q && python3 -c "..."'. NEVER say you cannot create .pptx, .xlsx, images, or other file formats.
 - When user pastes data it is saved to {work_dir}/user_input.txt — read it with run_python.
 - NEVER hardcode data values in scripts. ALWAYS read from the file and parse programmatically.
 - NEVER ask the user for data that is already in the input.
