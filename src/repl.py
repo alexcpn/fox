@@ -19,7 +19,7 @@ _FOX_BANNER = r"(/\_/\)  🦊 Fox — A Clever and Cunning Agent Loop"
 
 def main():
     # Resolve model before anything else — checks Ollama, asks if needed
-    resolve_model(_ollama._ollama.MODEL)
+    resolve_model(_ollama.MODEL)
 
     work_dir = tempfile.mkdtemp(prefix="fox_work_")
     storage = Storage()
