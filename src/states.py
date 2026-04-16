@@ -166,13 +166,13 @@ class TaskStateMachine:
             # ── TOOL_CALLING: dispatch commands ───────────────────────────
             elif self.state == TaskState.TOOL_CALLING:
                 tool_calls = (current_response or {}).get("tool_calls", [])
+                # Transition once for the whole batch — not per tool call
+                self.transition(TaskState.WAITING_RESULT, storage=storage)
+
                 for tc in tool_calls:
                     func = tc.get("function", {})
                     name = func.get("name", "?")
                     args = func.get("arguments", {})
-
-                    self.transition(TaskState.WAITING_RESULT, storage=storage)
-
                     tool_call_id = tc.get("id", "")  # OpenAI requires this back
 
                     try:
@@ -187,8 +187,7 @@ class TaskStateMachine:
                         if tool_call_id:
                             tool_msg["tool_call_id"] = tool_call_id
                         messages.append(tool_msg)
-                        self.transition(TaskState.EVALUATING, storage=storage)
-                        continue
+                        continue  # stay in WAITING_RESULT, process next tool
 
                     truncated = smart_truncate(name, cmd_result.output)
                     _print_tool(name, args, truncated)
