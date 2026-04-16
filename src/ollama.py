@@ -314,20 +314,37 @@ def _normalize_openai_response(msg: dict) -> dict:
 def _prepare_messages_for_openai(messages: list[dict]) -> list[dict]:
     """Sanitize the message list before sending to OpenAI.
 
-    OpenAI rejects:
-    - assistant messages with tool_calls AND content="" (must be null/absent)
-    - tool messages missing tool_call_id when a preceding assistant had tool_calls
+    OpenAI requires:
+    - assistant tool_call messages: content must be null/absent (not "")
+    - tool_calls entries: must have type="function" and arguments as JSON string
+    - tool result messages: must have tool_call_id
     """
     out = []
     for msg in messages:
         m = dict(msg)
         role = m.get("role")
-        if role == "assistant" and m.get("tool_calls") and not m.get("content"):
-            m.pop("content", None)   # null content required, not ""
+
+        if role == "assistant" and m.get("tool_calls"):
+            # content must be absent/null, not empty string
+            if not m.get("content"):
+                m.pop("content", None)
+            # Re-serialize tool_calls to OpenAI wire format
+            fixed = []
+            for tc in m["tool_calls"]:
+                tc = dict(tc)
+                func = dict(tc.get("function", {}))
+                args = func.get("arguments", {})
+                if isinstance(args, dict):
+                    func["arguments"] = json.dumps(args)  # must be JSON string
+                tc["function"] = func
+                if "type" not in tc:
+                    tc["type"] = "function"
+                fixed.append(tc)
+            m["tool_calls"] = fixed
+
         if role == "tool" and "tool_call_id" not in m:
-            # If we lost the id (e.g. from context compression), add a placeholder
-            # so the API doesn't reject the whole request
-            m["tool_call_id"] = "unknown"
+            m["tool_call_id"] = "unknown"  # placeholder if lost via compression
+
         out.append(m)
     return out
 
