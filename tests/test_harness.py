@@ -150,14 +150,14 @@ TESTS: list[TestCase] = [
     ),
     TestCase(
         name="internet_fetch",
-        prompt="Use curl to fetch the current Bitcoin price from https://api.coindesk.com/v1/bpi/currentprice.json and report the USD price.",
+        prompt="Use curl to fetch https://wttr.in/?format=3 and report what it returns.",
         check=check_any(
-            check_contains("USD"),
-            check_contains("bitcoin"),
-            check_contains("price"),
-            check_contains("$"),
+            check_contains("°"),
+            check_contains("wttr"),
+            check_contains("weather"),
+            check_contains("+"),
         ),
-        check_desc="response contains price information",
+        check_desc="response contains weather data",
     ),
 ]
 

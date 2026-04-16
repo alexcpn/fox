@@ -292,15 +292,29 @@ class Storage:
             "WHERE task_id=? ORDER BY timestamp DESC LIMIT ?",
             [task_id, window],
         ).fetchall()
+        if len(rows) < 2:
+            return False
+        # Fast-exit: if the last 2 calls are identical AND both failed, stop now.
+        if len(rows) >= 2:
+            r0, r1 = rows[0], rows[1]
+            if (r0[0], r0[1]) == (r1[0], r1[1]):
+                # Check if both failed (success=False in tool_calls)
+                row = self.conn.execute(
+                    "SELECT COUNT(*) FROM tool_calls WHERE task_id=? AND tool_name=? "
+                    "AND args_hash=? AND success=false ORDER BY timestamp DESC LIMIT 2",
+                    [task_id, r0[0], r0[1]],
+                ).fetchone()
+                if row and row[0] >= 2:
+                    return True
         if len(rows) < 3:
             return False
-        # Check if any (name, hash) pair appears more than once
-        seen: set = set()
+        # General case: any (name, args_hash) pair appears 3+ times
+        counts: dict = {}
         for row in rows:
             key = (row[0], row[1])
-            if key in seen:
+            counts[key] = counts.get(key, 0) + 1
+            if counts[key] >= 3:
                 return True
-            seen.add(key)
         return False
 
     # ── Startup GC ────────────────────────────────────────────────────────────
