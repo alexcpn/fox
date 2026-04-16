@@ -14,6 +14,76 @@ CONTEXT_WINDOW  = int(os.environ.get("CONTEXT_WINDOW",  "8"))
 TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "500"))
 
 
+# ── Model resolution ──────────────────────────────────────────────────────────
+
+def list_models() -> list[str]:
+    """Return model names available in Ollama, or [] on failure."""
+    try:
+        resp = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        resp.raise_for_status()
+        return [m["name"] for m in resp.json().get("models", [])]
+    except Exception:
+        return []
+
+
+def resolve_model(preferred: str) -> str:
+    """
+    Check Ollama for available models.
+    - If preferred model is available: use it.
+    - If not available but others exist: print a numbered list and ask the user.
+    - If Ollama is unreachable: warn and proceed anyway (will fail at chat time).
+    Returns the chosen model name (updates the module-level MODEL).
+    """
+    global MODEL
+    available = list_models()
+
+    if not available:
+        print(f"  \033[33m⚠ Could not reach Ollama at {OLLAMA_URL} — proceeding with '{preferred}'\033[0m")
+        return preferred
+
+    # Normalize: strip tag suffixes for loose matching (e.g. "gemma4" matches "gemma4:latest")
+    def base(name: str) -> str:
+        return name.split(":")[0].lower()
+
+    preferred_base = base(preferred)
+    exact = next((m for m in available if m == preferred), None)
+    loose = next((m for m in available if base(m) == preferred_base), None)
+
+    chosen = exact or loose
+    if chosen:
+        MODEL = chosen
+        return chosen
+
+    # Preferred not found — ask
+    print(f"\n  \033[33m⚠ Model '{preferred}' not found in Ollama.\033[0m")
+    print(f"  Available models:")
+    for i, name in enumerate(available, 1):
+        print(f"    {i}. {name}")
+    print()
+
+    while True:
+        try:
+            raw = input("  Choose a model (number or name): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n  Using first available: {available[0]}")
+            MODEL = available[0]
+            return MODEL
+
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(available):
+                MODEL = available[idx]
+                return MODEL
+        elif raw in available:
+            MODEL = raw
+            return MODEL
+        elif any(base(m) == base(raw) for m in available):
+            MODEL = next(m for m in available if base(m) == base(raw))
+            return MODEL
+
+        print(f"  Invalid choice — enter a number 1–{len(available)} or a model name.")
+
+
 # ── Tool definitions ──────────────────────────────────────────────────────────
 
 TOOLS = [

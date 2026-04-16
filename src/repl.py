@@ -9,7 +9,8 @@ import uuid
 from src.storage import Storage
 from src.commands import CommandRegistry
 from src.mapreduce import MapReduceOrchestrator, save_user_input
-from src.ollama import chat, build_system_prompt, MODEL, OLLAMA_URL
+import src.ollama as _ollama
+from src.ollama import chat, build_system_prompt, OLLAMA_URL, resolve_model
 from src.terminal import read_input
 
 
@@ -17,6 +18,9 @@ _FOX_BANNER = r"(/\_/\)  🦊 Fox — A Clever and Cunning Agent Loop"
 
 
 def main():
+    # Resolve model before anything else — checks Ollama, asks if needed
+    resolve_model(_ollama._ollama.MODEL)
+
     work_dir = tempfile.mkdtemp(prefix="fox_work_")
     storage = Storage()
 
@@ -26,7 +30,7 @@ def main():
         print(f"  \033[90mGC: marked {gc_count} incomplete task(s) from prior sessions as FAILED\033[0m")
 
     session_id = f"sess-{uuid.uuid4().hex[:8]}"
-    storage.create_session(session_id, MODEL, os.getcwd())
+    storage.create_session(session_id, _ollama.MODEL, os.getcwd())
 
     command_registry = CommandRegistry(work_dir, storage)
     messages = [{"role": "system", "content": build_system_prompt(work_dir)}]
@@ -40,7 +44,7 @@ def main():
     )
 
     print(f"\033[33;1m{_FOX_BANNER}\033[0m")
-    print(f"\033[1m  {MODEL} @ {OLLAMA_URL}\033[0m")
+    print(f"\033[1m  {_ollama.MODEL} @ {OLLAMA_URL}\033[0m")
     print(f"   cwd:     {os.getcwd()}")
     print(f"   scratch: {work_dir}")
     print(f"   Enter → send  |  Alt+Enter → newline  |  Paste → auto-captured")
