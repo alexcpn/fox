@@ -33,3 +33,6 @@ _script.py
 # OS
 .DS_Store
 Thumbs.db
+*.pptx
+*.csv
+fox_hello.txt

@@ -4,6 +4,7 @@ through explicit, validated state transitions.
 """
 
 import enum
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
@@ -36,6 +37,21 @@ TRANSITIONS: dict[TaskState, set[TaskState]] = {
 TERMINAL = {TaskState.COMPLETED, TaskState.FAILED}
 
 
+# ── Creation task detection ───────────────────────────────────────────────────
+
+_CREATION_VERBS = re.compile(
+    r'\b(create|generate|write|make|build|produce|output|export)\b', re.I
+)
+_CREATION_TARGETS = re.compile(
+    r'\b(pptx?|xlsx?|csv|pdf|image|png|jpg|file|script|report|chart|graph|doc)\b', re.I
+)
+
+
+def _is_creation_task(description: str) -> bool:
+    """Return True if the task asks to create/generate a file."""
+    return bool(_CREATION_VERBS.search(description) and _CREATION_TARGETS.search(description))
+
+
 # ── Transition record ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -58,6 +74,7 @@ class TaskStateMachine:
     error:       Optional[str] = None
     turn_count:  int = 0
     max_turns:   int = 10
+    _tools_called: set = field(default_factory=set)  # tracks tool names used this task
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -171,6 +188,7 @@ class TaskStateMachine:
                     truncated = smart_truncate(name, cmd_result.output)
                     _print_tool(name, args, truncated)
                     messages.append({"role": "tool", "content": truncated})
+                    self._tools_called.add(name)
 
                 # Loop detection via graph
                 if storage.detect_cycles(self.task_id):
@@ -186,11 +204,33 @@ class TaskStateMachine:
                 has_tool_calls = bool(resp.get("tool_calls"))
 
                 if content and not has_tool_calls:
-                    self.result = content
-                    self.transition(TaskState.COMPLETED, storage=storage)
-                    storage.update_task_state(
-                        self.task_id, TaskState.COMPLETED.value, result=content
-                    )
+                    # Check for hallucinated completion: model described creating a
+                    # file but never actually called run_bash or write_file.
+                    if _is_creation_task(self.description) and \
+                            not (self._tools_called & {"run_bash", "write_file"}) and \
+                            not getattr(self, "_creation_nudged", False):
+                        self._creation_nudged = True  # type: ignore[attr-defined]
+                        print(f"\n  \033[33m⚠ creation task — no file tool called; nudging\033[0m")
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "You described creating a file but did not call run_bash or write_file. "
+                                "You MUST actually create the file:\n"
+                                "1. run_bash: pip install <package> -q && echo OK\n"
+                                "2. run_bash: python3 -c \"<script that creates the file>\"\n"
+                                "Do it now. Do not describe — execute."
+                            ),
+                        })
+                        messages[:] = compress_context(
+                            messages, query=self.description, turn=self.turn_count
+                        )
+                        self.transition(TaskState.EXECUTING, storage=storage)
+                    else:
+                        self.result = content
+                        self.transition(TaskState.COMPLETED, storage=storage)
+                        storage.update_task_state(
+                            self.task_id, TaskState.COMPLETED.value, result=content
+                        )
                 else:
                     # Compress context before next LLM call
                     messages[:] = compress_context(

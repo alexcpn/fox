@@ -144,7 +144,9 @@ Scratch directory: {work_dir}
 RULES:
 - Internet access via curl in run_bash. Never say you cannot fetch data.
 - For data processing use run_python with stdlib only (csv, re, json, collections). No pandas/numpy.
-- To use third-party libraries (e.g. python-pptx, pillow, openpyxl), install via run_bash: 'pip install <pkg> -q && python3 -c "..."'. NEVER say you cannot create .pptx, .xlsx, images, or other file formats.
+- To use third-party libraries (e.g. python-pptx, pillow, openpyxl), install via run_bash: 'pip install <pkg> -q && echo OK', then run the script in a second run_bash call. NEVER say you cannot create .pptx, .xlsx, images, or other file formats.
+- FILE CREATION RULE: If asked to CREATE, GENERATE, WRITE, or MAKE a file — you MUST call run_bash or write_file. Describing what you would write is NOT acceptable and will be rejected. Always produce the actual file.
+- When user says "this data" or "the above" they mean the content already in the conversation. Use it directly — do not ask for it again.
 - When user pastes data it is saved to {work_dir}/user_input.txt — read it with run_python.
 - NEVER hardcode data values in scripts. ALWAYS read from the file and parse programmatically.
 - NEVER ask the user for data that is already in the input.
@@ -172,6 +174,10 @@ _SPINNER_FRAMES = [
 
 
 def _spin(stop_event: threading.Event) -> None:
+    import sys as _sys
+    if not _sys.stdout.isatty():
+        stop_event.wait()
+        return
     i = 0
     while not stop_event.is_set():
         frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
