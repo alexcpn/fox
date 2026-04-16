@@ -156,7 +156,16 @@ def sliding_window(messages: list[dict], window_size: int = 8) -> list[dict]:
         return messages
 
     evicted = body[:-window_size]
-    kept = body[-window_size:]
+    kept = list(body[-window_size:])
+
+    # Never leave orphaned tool messages at the head of the kept window.
+    # If a tool message's parent assistant (tool_calls) was evicted, the tool
+    # message is now unlinked — OpenAI rejects these. Push them into evicted.
+    while kept and kept[0].get("role") == "tool":
+        evicted.append(kept.pop(0))
+
+    if not kept:
+        return messages  # nothing useful left; keep original
 
     # Build topic hints from evicted user messages
     user_hints = []
