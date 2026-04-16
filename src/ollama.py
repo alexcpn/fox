@@ -172,7 +172,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write content to a file, creating it if needed.",
+            "description": (
+                "Write text content to a file, creating it if needed. "
+                "TEXT FILES ONLY (.py, .txt, .csv, .md, .json, .html, etc.). "
+                "Do NOT use for binary formats (.pptx, .xlsx, .docx, .pdf, .png, etc.) — "
+                "those require library-generated binary output; use run_bash with python-pptx/openpyxl instead."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -239,6 +244,8 @@ RULES:
 - Internet access via curl in run_bash. Never say you cannot fetch data.
 - For data processing use run_python with stdlib only (csv, re, json, collections). No pandas/numpy.
 - To use third-party libraries (e.g. python-pptx, pillow, openpyxl), install via run_bash: 'pip install <pkg> -q && echo OK', then run the script in a second run_bash call. NEVER say you cannot create .pptx, .xlsx, images, or other file formats.
+- BINARY FILE RULE: .pptx/.xlsx/.docx/.pdf/.png files MUST be created with run_bash using the correct library. write_file is for TEXT ONLY. Wrong: write_file(path="x.pptx", content="<ppt>..."). Right: run_bash("python3 -c \"from pptx import Presentation; ...\"").
+- PPTX PATTERN (mandatory): from pptx import Presentation; prs = Presentation(); slide = prs.slides.add_slide(prs.slide_layouts[1]); slide.shapes.title.text='Title'; slide.placeholders[1].text='Body'; prs.save('out.pptx'); print('saved')
 - FILE CREATION RULE: If asked to CREATE, GENERATE, WRITE, or MAKE a file — you MUST call run_bash or write_file. Describing what you would write is NOT acceptable and will be rejected. Always produce the actual file.
 - When user says "this data" or "the above" they mean the content already in the conversation. Use it directly — do not ask for it again.
 - When user pastes data it is saved to {work_dir}/user_input.txt — read it with run_python.

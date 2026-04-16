@@ -161,6 +161,13 @@ class ReadFileCommand(ToolCommand):
         return self.result
 
 
+_BINARY_EXTENSIONS = {
+    ".pptx", ".ppt", ".xlsx", ".xls", ".docx", ".doc",
+    ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".zip",
+    ".tar", ".gz", ".bz2", ".whl", ".egg",
+}
+
+
 class WriteFileCommand(ToolCommand):
     name = "write_file"
 
@@ -174,6 +181,28 @@ class WriteFileCommand(ToolCommand):
             path = os.path.expanduser(self.args["path"])
             if not os.path.isabs(path):
                 path = os.path.join(os.getcwd(), path)
+
+            # Block text writes to binary format extensions — these files require
+            # library-generated binary content and cannot be created by writing text.
+            ext = os.path.splitext(path)[1].lower()
+            if ext in _BINARY_EXTENSIONS:
+                msg = (
+                    f"Error: write_file cannot create {ext} files — they require binary "
+                    f"library output, not text. Use run_bash with python-pptx/openpyxl/etc:\n"
+                    f"  1. run_bash: pip install python-pptx -q && echo OK\n"
+                    f"  2. run_bash: python3 << 'EOF'\n"
+                    f"from pptx import Presentation\n"
+                    f"prs = Presentation()\n"
+                    f"slide = prs.slides.add_slide(prs.slide_layouts[1])\n"
+                    f"slide.shapes.title.text = 'Title'\n"
+                    f"slide.placeholders[1].text = 'Content'\n"
+                    f"prs.save('{path}')\n"
+                    f"print('Saved {path}')\n"
+                    f"EOF"
+                )
+                self.result = CommandResult(msg, False, time.time() - t0)
+                return self.result
+
             if os.path.exists(path):
                 with open(path) as f:
                     self._previous_content = f.read()
