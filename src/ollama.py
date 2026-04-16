@@ -1,15 +1,19 @@
 """
-Fox Ollama interface — chat(), TOOLS list, and system prompt builder.
+Fox chat interface — supports Ollama (local) and OpenAI backends.
 """
 
+import json
 import os
 import time
 import threading
 import requests
 
-OLLAMA_URL   = os.environ.get("OLLAMA_URL",       "http://localhost:11434")
-MODEL        = os.environ.get("OLLAMA_MODEL",      "gemma4")
-MAX_TURNS    = int(os.environ.get("MAX_AGENT_TURNS", "30"))
+OLLAMA_URL      = os.environ.get("OLLAMA_URL",        "http://localhost:11434")
+MODEL           = os.environ.get("OLLAMA_MODEL",       "gemma4")
+BACKEND         = "ollama"   # "ollama" | "openai" — set by resolve_model()
+OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY",    "")
+OPENAI_URL      = "https://api.openai.com/v1/chat/completions"
+MAX_TURNS       = int(os.environ.get("MAX_AGENT_TURNS", "30"))
 CONTEXT_WINDOW  = int(os.environ.get("CONTEXT_WINDOW",  "8"))
 TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "500"))
 
@@ -26,62 +30,82 @@ def list_models() -> list[str]:
         return []
 
 
+_OPENAI_MODELS = ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
+
+
+def _pick_from_list(prompt: str, items: list[str]) -> str:
+    """Print a numbered list and return the chosen item."""
+    for i, name in enumerate(items, 1):
+        print(f"    {i}. {name}")
+    print()
+    while True:
+        try:
+            raw = input(f"  {prompt}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n  Using first: {items[0]}")
+            return items[0]
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(items):
+                return items[idx]
+        elif raw in items:
+            return raw
+        print(f"  Enter a number 1–{len(items)} or a name.")
+
+
 def resolve_model(preferred: str) -> str:
     """
-    Check Ollama for available models.
-    - If preferred model is available: use it.
-    - If not available but others exist: print a numbered list and ask the user.
-    - If Ollama is unreachable: warn and proceed anyway (will fail at chat time).
-    Returns the chosen model name (updates the module-level MODEL).
+    Choose backend and model at startup.
+    - If OPENAI_API_KEY is set: ask user — OpenAI or local Ollama?
+    - Ollama path: verify model exists, offer list if not found.
+    - OpenAI path: show model list, user picks.
+    Updates module globals BACKEND and MODEL; returns chosen model name.
     """
-    global MODEL
+    global MODEL, BACKEND
+
+    def base(name: str) -> str:
+        return name.split(":")[0].lower()
+
+    # ── Offer OpenAI if key is present ────────────────────────────────────────
+    if OPENAI_API_KEY:
+        print(f"\n  OpenAI API key found. Which backend?")
+        print(f"    1. OpenAI  (fast, cloud)")
+        print(f"    2. Ollama  (local, private)")
+        print()
+        try:
+            choice = input("  Choose [1/2, default=1]: ").strip() or "1"
+        except (EOFError, KeyboardInterrupt):
+            choice = "1"
+
+        if choice != "2":
+            BACKEND = "openai"
+            print(f"\n  OpenAI models:")
+            MODEL = _pick_from_list("Choose model (default=gpt-4o-mini)", _OPENAI_MODELS)
+            print(f"  → OpenAI / {MODEL}\n")
+            return MODEL
+
+    # ── Ollama path ───────────────────────────────────────────────────────────
+    BACKEND = "ollama"
     available = list_models()
 
     if not available:
         print(f"  \033[33m⚠ Could not reach Ollama at {OLLAMA_URL} — proceeding with '{preferred}'\033[0m")
-        return preferred
+        MODEL = preferred
+        return MODEL
 
-    # Normalize: strip tag suffixes for loose matching (e.g. "gemma4" matches "gemma4:latest")
-    def base(name: str) -> str:
-        return name.split(":")[0].lower()
-
-    preferred_base = base(preferred)
     exact = next((m for m in available if m == preferred), None)
-    loose = next((m for m in available if base(m) == preferred_base), None)
-
+    loose = next((m for m in available if base(m) == base(preferred)), None)
     chosen = exact or loose
     if chosen:
         MODEL = chosen
-        return chosen
+        return MODEL
 
     # Preferred not found — ask
     print(f"\n  \033[33m⚠ Model '{preferred}' not found in Ollama.\033[0m")
     print(f"  Available models:")
-    for i, name in enumerate(available, 1):
-        print(f"    {i}. {name}")
-    print()
-
-    while True:
-        try:
-            raw = input("  Choose a model (number or name): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print(f"\n  Using first available: {available[0]}")
-            MODEL = available[0]
-            return MODEL
-
-        if raw.isdigit():
-            idx = int(raw) - 1
-            if 0 <= idx < len(available):
-                MODEL = available[idx]
-                return MODEL
-        elif raw in available:
-            MODEL = raw
-            return MODEL
-        elif any(base(m) == base(raw) for m in available):
-            MODEL = next(m for m in available if base(m) == base(raw))
-            return MODEL
-
-        print(f"  Invalid choice — enter a number 1–{len(available)} or a model name.")
+    MODEL = _pick_from_list("Choose a model (number or name)", available)
+    print(f"  → Ollama / {MODEL}\n")
+    return MODEL
 
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
@@ -256,28 +280,85 @@ def _spin(stop_event: threading.Event) -> None:
         time.sleep(0.12)
 
 
-def chat(messages: list[dict], use_tools: bool = True, think: bool = True) -> dict:
+def _normalize_openai_response(msg: dict) -> dict:
+    """Convert OpenAI chat response message to Ollama-compatible format.
+
+    Key differences:
+    - OpenAI tool call arguments are a JSON *string*; Ollama uses a dict.
+    - OpenAI tool calls carry an `id` field needed for tool result messages.
+    - OpenAI may return content=None when only tool calls are present.
+    """
+    result: dict = {
+        "role": msg.get("role", "assistant"),
+        "content": msg.get("content") or "",
+    }
+    raw_tcs = msg.get("tool_calls")
+    if raw_tcs:
+        normalized = []
+        for tc in raw_tcs:
+            func = tc.get("function", {})
+            args = func.get("arguments", "{}")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            normalized.append({
+                "id": tc.get("id", ""),       # preserved for tool result messages
+                "function": {"name": func.get("name", ""), "arguments": args},
+            })
+        result["tool_calls"] = normalized
+    return result
+
+
+def _chat_openai(messages: list[dict], use_tools: bool) -> dict:
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
     payload: dict = {
-        "model":   MODEL,
+        "model": MODEL,
         "messages": messages,
-        "stream":  False,
-        "think":   think,
+    }
+    if use_tools:
+        payload["tools"] = TOOLS
+        payload["tool_choice"] = "auto"
+
+    resp = requests.post(OPENAI_URL, json=payload, headers=headers, timeout=120)
+    resp.raise_for_status()
+    return _normalize_openai_response(resp.json()["choices"][0]["message"])
+
+
+def _chat_ollama(messages: list[dict], use_tools: bool, think: bool) -> dict:
+    payload: dict = {
+        "model":    MODEL,
+        "messages": messages,
+        "stream":   False,
+        "think":    think,
     }
     if use_tools:
         payload["tools"] = TOOLS
 
+    resp = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=600)
+    resp.raise_for_status()
+    return resp.json()["message"]
+
+
+def chat(messages: list[dict], use_tools: bool = True, think: bool = True) -> dict:
     stop = threading.Event()
     spinner = threading.Thread(target=_spin, args=(stop,), daemon=True)
     spinner.start()
 
     t0 = time.time()
     try:
-        resp = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=600)
+        if BACKEND == "openai":
+            result = _chat_openai(messages, use_tools)
+        else:
+            result = _chat_ollama(messages, use_tools, think)
     finally:
         stop.set()
         spinner.join()
 
     elapsed = time.time() - t0
     print(f"\r  \033[90m🦊 [{elapsed:.0f}s]\033[0m  ", end="", flush=True)
-    resp.raise_for_status()
-    return resp.json()["message"]
+    return result

@@ -173,6 +173,8 @@ class TaskStateMachine:
 
                     self.transition(TaskState.WAITING_RESULT, storage=storage)
 
+                    tool_call_id = tc.get("id", "")  # OpenAI requires this back
+
                     try:
                         cmd = command_registry.build(tc)
                         cmd_result = command_registry.execute_with_cache(
@@ -181,13 +183,19 @@ class TaskStateMachine:
                     except Exception as e:
                         cmd_result_text = f"Tool error: {e}"
                         _print_tool(name, args, cmd_result_text)
-                        messages.append({"role": "tool", "content": cmd_result_text})
+                        tool_msg: dict = {"role": "tool", "content": cmd_result_text}
+                        if tool_call_id:
+                            tool_msg["tool_call_id"] = tool_call_id
+                        messages.append(tool_msg)
                         self.transition(TaskState.EVALUATING, storage=storage)
                         continue
 
                     truncated = smart_truncate(name, cmd_result.output)
                     _print_tool(name, args, truncated)
-                    messages.append({"role": "tool", "content": truncated})
+                    tool_msg = {"role": "tool", "content": truncated}
+                    if tool_call_id:
+                        tool_msg["tool_call_id"] = tool_call_id
+                    messages.append(tool_msg)
                     self._tools_called.add(name)
 
                 # Loop detection via graph
