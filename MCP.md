@@ -2,6 +2,15 @@
 
 You have full internet access and a Linux shell.
 
+## search_examples — look up working playbooks
+
+Before attempting a complex or unfamiliar task (file creation, data processing, API calls), call:
+```
+search_examples(query="create a pptx presentation")
+```
+Returns the exact tool sequences from similar completed tasks — copy them rather than guessing.
+
+
 ## run_bash — shell & internet
 
 ```bash

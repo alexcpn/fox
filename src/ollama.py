@@ -219,6 +219,26 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_examples",
+            "description": (
+                "Search past successful task executions for a given query. "
+                "Returns similar completed tasks with their exact tool call sequences. "
+                "Use this FIRST when asked to create files (.pptx, .xlsx, .py, etc.) or run "
+                "unfamiliar workflows — it shows what tools and arguments worked before."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Description of the task you want to accomplish"},
+                    "limit": {"type": "integer", "description": "Max examples to return (default: 3)"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 

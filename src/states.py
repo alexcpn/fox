@@ -238,6 +238,11 @@ class TaskStateMachine:
                         storage.update_task_state(
                             self.task_id, TaskState.COMPLETED.value, result=content
                         )
+                        # Persist the successful tool chain as a playbook entry
+                        try:
+                            storage.record_task_chain(self.task_id)
+                        except Exception:
+                            pass  # never let chain recording crash the task
                 else:
                     # Compress context before next LLM call
                     messages[:] = compress_context(

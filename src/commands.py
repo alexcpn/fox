@@ -287,15 +287,63 @@ class ListFilesCommand(ToolCommand):
         return self.result
 
 
+class SearchExamplesCommand(ToolCommand):
+    """Query DuckDB for successful tool chains similar to a given task description."""
+    name = "search_examples"
+
+    def __init__(self, args: dict, storage: "Storage"):
+        super().__init__(args)
+        self._storage = storage
+
+    def execute(self) -> CommandResult:
+        t0 = time.time()
+        query = self.args.get("query", "").strip()
+        limit = int(self.args.get("limit", 3))
+        if not query:
+            self.result = CommandResult("Error: query is required", False, time.time() - t0)
+            return self.result
+
+        try:
+            chains = self._storage.find_similar_chains(query, limit=limit)
+        except Exception as e:
+            self.result = CommandResult(f"Error: {e}", False, time.time() - t0)
+            return self.result
+
+        if not chains:
+            self.result = CommandResult(
+                "No similar completed tasks found in history.", True, time.time() - t0
+            )
+            return self.result
+
+        lines = []
+        for i, chain in enumerate(chains, 1):
+            lines.append(f"--- Example {i} (score={chain['score']}) ---")
+            lines.append(f"Task: {chain['description']}")
+            lines.append("Steps:")
+            for step in chain["steps"]:
+                # Redact long args to keep context lean
+                args_repr = json.dumps(step["args"])
+                if len(args_repr) > 120:
+                    args_repr = args_repr[:117] + "..."
+                lines.append(f"  {step['tool']}({args_repr})")
+                if step["output_summary"]:
+                    lines.append(f"    → {step['output_summary'][:100]}")
+            lines.append("")
+
+        self.result = CommandResult("\n".join(lines), True, time.time() - t0)
+        return self.result
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 _COMMAND_MAP: dict[str, type] = {
-    "run_bash":    RunBashCommand,
-    "run_python":  RunPythonCommand,
-    "read_file":   ReadFileCommand,
-    "write_file":  WriteFileCommand,
-    "grep_search": GrepSearchCommand,
-    "list_files":  ListFilesCommand,
+    "run_bash":        RunBashCommand,
+    "run_python":      RunPythonCommand,
+    "read_file":       ReadFileCommand,
+    "write_file":      WriteFileCommand,
+    "grep_search":     GrepSearchCommand,
+    "list_files":      ListFilesCommand,
+    "search_examples": SearchExamplesCommand,
 }
 
 
@@ -312,6 +360,8 @@ class CommandRegistry:
             raise ValueError(f"Unknown tool: {name}")
         if cls is RunPythonCommand:
             return cls(args, self.work_dir)
+        if cls is SearchExamplesCommand:
+            return cls(args, self.storage)
         return cls(args)
 
     def execute_with_cache(

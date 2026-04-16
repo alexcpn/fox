@@ -105,6 +105,15 @@ class Storage:
                 timestamp    DOUBLE
             )
         """)
+        # Successful tool chains — indexed by task for fast playbook lookup
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_chains (
+                task_id      VARCHAR PRIMARY KEY,
+                description  VARCHAR,
+                steps_json   VARCHAR,   -- JSON array of {tool, args, output_summary}
+                completed_at DOUBLE
+            )
+        """)
 
     # ── Sessions ─────────────────────────────────────────────────────────────
 
@@ -320,6 +329,94 @@ class Storage:
             if counts[key] >= 3:
                 return True
         return False
+
+    # ── Task chains (playbook) ────────────────────────────────────────────────
+
+    def record_task_chain(self, task_id: str):
+        """
+        Snapshot the successful tool call sequence for a completed task.
+        Called by the state machine when a task reaches COMPLETED.
+        Only records chains that have at least one successful tool call.
+        """
+        rows = self.conn.execute(
+            "SELECT t.description, tc.tool_name, tc.args_json, tc.output, tc.success "
+            "FROM tasks t JOIN tool_calls tc ON tc.task_id = t.task_id "
+            "WHERE t.task_id = ? AND t.state = 'COMPLETED' "
+            "ORDER BY tc.timestamp",
+            [task_id],
+        ).fetchall()
+
+        if not rows:
+            return
+
+        description = rows[0][0]
+        steps = []
+        for _, tool_name, args_json, output, success in rows:
+            if not success:
+                continue
+            # Keep output summary short — just enough for context matching
+            output_summary = (output or "")[:200].replace("\n", " ")
+            steps.append({
+                "tool": tool_name,
+                "args": json.loads(args_json) if args_json else {},
+                "output_summary": output_summary,
+            })
+
+        if not steps:
+            return
+
+        self.conn.execute(
+            "INSERT INTO task_chains (task_id, description, steps_json, completed_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (task_id) DO UPDATE SET steps_json=excluded.steps_json",
+            [task_id, description, json.dumps(steps), time.time()],
+        )
+
+    def find_similar_chains(self, query: str, limit: int = 3) -> list[dict]:
+        """
+        Return the `limit` most relevant completed task chains for a query.
+        Uses TF-IDF over task descriptions. Returns list of dicts with
+        keys: description, steps (list of {tool, args, output_summary}), score.
+        """
+        rows = self.conn.execute(
+            "SELECT task_id, description, steps_json FROM task_chains ORDER BY completed_at DESC LIMIT 200"
+        ).fetchall()
+
+        if not rows:
+            return []
+
+        try:
+            from src.relevance import TFIDFIndex
+        except ImportError:
+            # Fallback: return most recent
+            rows = rows[:limit]
+            return [
+                {
+                    "description": r[1],
+                    "steps": json.loads(r[2]),
+                    "score": 1.0,
+                }
+                for r in rows
+            ]
+
+        idx = TFIDFIndex()
+        for task_id, description, _ in rows:
+            idx.add_document(task_id, description)
+
+        scores = dict(idx.score(query))
+        ranked = sorted(rows, key=lambda r: scores.get(r[0], 0.0), reverse=True)
+
+        results = []
+        for task_id, description, steps_json in ranked[:limit]:
+            score = scores.get(task_id, 0.0)
+            if score == 0.0 and results:
+                break  # stop at zero-score entries once we have some results
+            results.append({
+                "description": description,
+                "steps": json.loads(steps_json),
+                "score": round(score, 4),
+            })
+        return results
 
     # ── Startup GC ────────────────────────────────────────────────────────────
 
