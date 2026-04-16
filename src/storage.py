@@ -14,9 +14,13 @@ DB_PATH = os.path.expanduser("~/.local/share/fox/history.duckdb")
 
 class Storage:
     def __init__(self, db_path: str = DB_PATH):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
         import duckdb
-        self.conn = duckdb.connect(db_path)
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        try:
+            self.conn = duckdb.connect(db_path)
+        except Exception:
+            print(f"  \033[33m⚠ DB locked ({db_path}), using in-memory storage\033[0m")
+            self.conn = duckdb.connect(":memory:")
         self._init_schema()
 
     # ── Schema ───────────────────────────────────────────────────────────────
