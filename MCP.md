@@ -2,31 +2,90 @@
 
 You have full internet access and a Linux shell.
 
-## curl
-```
-curl -s "URL"                          # GET
-curl -s -A "Mozilla/5.0" "URL"         # with user-agent
-```
-Stocks: `curl -s -A "Mozilla/5.0" "https://query1.finance.yahoo.com/v8/finance/chart/TICKER?range=1d" | jq '.chart.result[0].meta | {symbol,regularMarketPrice,currency}'`
-Weather: `curl -s "https://wttr.in/City?format=3"`
+## run_bash — shell & internet
 
-## jq, grep, awk
-```
+```bash
+# HTTP
+curl -s "URL"
+curl -s -A "Mozilla/5.0" "URL"          # with user-agent
+
+# Stocks
+curl -s -A "Mozilla/5.0" "https://query1.finance.yahoo.com/v8/finance/chart/TICKER?range=1d" \
+  | jq '.chart.result[0].meta | {symbol,regularMarketPrice,currency}'
+
+# Weather
+curl -s "https://wttr.in/City?format=3"
+
+# Install a package (always append && echo OK — pip -q is silent on success)
+pip install python-pptx -q && echo OK
+
+# jq / grep / awk
 cat f.json | jq '.field'
 grep -rn "pattern" /path
 awk -F'\t' '{print $1,$3}' file
 ```
 
-## run_python — PATTERNS TO FOLLOW
+## Binary file creation — ALWAYS use run_bash
 
-IMPORTANT: Always read data from files. Never hardcode values. Use only stdlib.
+write_file is for text files only (.py, .txt, .csv, .md, .json). For binary formats use run_bash.
 
-### Parse TSV/CSV from a file:
+### .pptx (python-pptx)
+```bash
+pip install python-pptx -q && echo OK
+```
+```python
+from pptx import Presentation
+from pptx.util import Inches, Pt
+
+prs = Presentation()
+layout = prs.slide_layouts[1]          # title + content
+
+slide = prs.slides.add_slide(layout)
+slide.shapes.title.text = "Slide Title"
+slide.placeholders[1].text = "Bullet 1\nBullet 2\nBullet 3"
+
+prs.save("/path/to/output.pptx")
+print("Saved /path/to/output.pptx")
+```
+
+### .xlsx (openpyxl)
+```bash
+pip install openpyxl -q && echo OK
+```
+```python
+from openpyxl import Workbook
+
+wb = Workbook()
+ws = wb.active
+ws.title = "Sheet1"
+ws.append(["Name", "Value"])           # header row
+ws.append(["Alpha", 42])
+
+wb.save("/path/to/output.xlsx")
+print("Saved /path/to/output.xlsx")
+```
+
+### images (pillow)
+```bash
+pip install pillow -q && echo OK
+```
+```python
+from PIL import Image, ImageDraw
+
+img = Image.new("RGB", (800, 600), "white")
+draw = ImageDraw.Draw(img)
+draw.text((100, 100), "Hello", fill="black")
+img.save("/path/to/output.png")
+print("Saved /path/to/output.png")
+```
+
+## run_python — data processing (stdlib only)
+
+### Parse TSV/CSV from user_input.txt:
 ```python
 import csv
-with open("/tmp/agent_work_xxx/user_input.txt") as f:
+with open("/tmp/fox_work_xxx/user_input.txt") as f:
     text = f.read()
-# Find TSV lines (lines with tabs)
 lines = text.strip().split("\n")
 tsv_lines = [l for l in lines if "\t" in l and l.count("\t") >= 2]
 if tsv_lines:
@@ -39,19 +98,18 @@ if tsv_lines:
 ### Parse key=value log lines:
 ```python
 import re
-with open("/tmp/agent_work_xxx/user_input.txt") as f:
+with open("/tmp/fox_work_xxx/user_input.txt") as f:
     text = f.read()
-# Extract key=value pairs
 pairs = re.findall(r'(\w+)\s*=\s*([\d.\-]+)', text)
 log_data = {k: float(v) for k, v in pairs}
 for k, v in log_data.items():
     print(f"  {k} = {v}")
 ```
 
-### Compare two datasets with a mapping:
+### Compare two datasets:
 ```python
 import re, csv
-with open("/tmp/agent_work_xxx/user_input.txt") as f:
+with open("/tmp/fox_work_xxx/user_input.txt") as f:
     text = f.read()
 
 # 1. Parse TSV
@@ -83,6 +141,8 @@ for log_key, csv_key in mapping.items():
 
 ## RULES
 - NEVER say you cannot access the internet. Use curl.
-- NEVER use pandas, numpy, or third-party libs in run_python.
-- NEVER hardcode data values. Read from the file and parse.
+- NEVER use pandas, numpy, or third-party libs in run_python (stdlib only).
+- NEVER hardcode data values. Read from the file and parse programmatically.
 - ALWAYS print actual numbers, not just "Match" or "Mismatch".
+- BINARY FILES: write_file cannot create .pptx/.xlsx/.docx/.pdf/.png — use the patterns above.
+- pip install: always append `&& echo OK` — silent success otherwise looks like failure.

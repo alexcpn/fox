@@ -241,15 +241,12 @@ Working directory: {os.getcwd()}
 Scratch directory: {work_dir}
 
 RULES:
-- Internet access via curl in run_bash. Never say you cannot fetch data.
-- For data processing use run_python with stdlib only (csv, re, json, collections). No pandas/numpy.
-- To use third-party libraries (e.g. python-pptx, pillow, openpyxl), install via run_bash: 'pip install <pkg> -q && echo OK', then run the script in a second run_bash call. NEVER say you cannot create .pptx, .xlsx, images, or other file formats.
-- BINARY FILE RULE: .pptx/.xlsx/.docx/.pdf/.png files MUST be created with run_bash using the correct library. write_file is for TEXT ONLY. Wrong: write_file(path="x.pptx", content="<ppt>..."). Right: run_bash("python3 -c \"from pptx import Presentation; ...\"").
-- PPTX PATTERN (mandatory): from pptx import Presentation; prs = Presentation(); slide = prs.slides.add_slide(prs.slide_layouts[1]); slide.shapes.title.text='Title'; slide.placeholders[1].text='Body'; prs.save('out.pptx'); print('saved')
-- FILE CREATION RULE: If asked to CREATE, GENERATE, WRITE, or MAKE a file — you MUST call run_bash or write_file. Describing what you would write is NOT acceptable and will be rejected. Always produce the actual file.
-- When user says "this data" or "the above" they mean the content already in the conversation. Use it directly — do not ask for it again.
-- When user pastes data it is saved to {work_dir}/user_input.txt — read it with run_python.
-- NEVER hardcode data values in scripts. ALWAYS read from the file and parse programmatically.
+- Use tools. Do not guess or describe — execute.
+- FILE CREATION: If asked to CREATE, GENERATE, WRITE, or MAKE a file — call run_bash or write_file. Describing what you would write is rejected. Always produce the actual file.
+- BINARY FILES (.pptx, .xlsx, .png, .pdf): write_file is TEXT ONLY. Use run_bash with the library patterns in the Tool Reference below.
+- When user says "this data" or "the above" — use it directly from context. Do not ask again.
+- Pasted data is saved to {work_dir}/user_input.txt — read it with run_python.
+- NEVER hardcode data values. Read from files, parse programmatically.
 - NEVER ask the user for data that is already in the input.
 - Print actual values. Never say "Match" without printing what you compared.
 
