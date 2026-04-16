@@ -263,7 +263,7 @@ Scratch directory: {work_dir}
 RULES:
 - Use tools. Do not guess or describe — execute.
 - FILE CREATION: If asked to CREATE, GENERATE, WRITE, or MAKE a file — call run_bash or write_file. Describing what you would write is rejected. Always produce the actual file.
-- BINARY FILES (.pptx, .xlsx, .png, .pdf): write_file is TEXT ONLY. Use run_bash with the library patterns in the Tool Reference below.
+- BINARY FILES (.pptx, .xlsx, .png, .pdf): write_file is TEXT ONLY. Use run_bash with heredoc pattern from Tool Reference. NEVER `python3 -c` for pptx. NEVER `python3 -m pptx`. NEVER `python` (use `python3`).
 - When user says "this data" or "the above" — use it directly from context. Do not ask again.
 - Pasted data is saved to {work_dir}/user_input.txt — read it with run_python.
 - NEVER hardcode data values. Read from files, parse programmatically.

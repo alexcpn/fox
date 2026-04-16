@@ -39,10 +39,13 @@ awk -F'\t' '{print $1,$3}' file
 write_file is for text files only (.py, .txt, .csv, .md, .json). For binary formats use run_bash.
 
 ### .pptx (python-pptx)
+Step 1 — install:
 ```bash
 pip install python-pptx -q && echo OK
 ```
-```python
+Step 2 — create with heredoc (NEVER use `python3 -c` for multi-line pptx code, NEVER use `python3 -m pptx`):
+```bash
+python3 << 'PYEOF'
 from pptx import Presentation
 from pptx.util import Inches, Pt
 
@@ -55,6 +58,7 @@ slide.placeholders[1].text = "Bullet 1\nBullet 2\nBullet 3"
 
 prs.save("/path/to/output.pptx")
 print("Saved /path/to/output.pptx")
+PYEOF
 ```
 
 ### .xlsx (openpyxl)

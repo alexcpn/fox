@@ -104,6 +104,8 @@ class TaskStateMachine:
     def _fail(self, reason: str, storage: Optional["Storage"] = None):
         self.error = reason
         self.transition(TaskState.FAILED, reason, storage)
+        if storage:
+            storage.update_task_state(self.task_id, "FAILED", error=reason)
 
     # ── Core loop ─────────────────────────────────────────────────────────────
 

@@ -75,11 +75,45 @@ class ToolCommand(ABC):
 class RunBashCommand(ToolCommand):
     name = "run_bash"
 
+    # Pre-execution guards — catch known bad patterns before wasting a shell call
+    _BAD_PATTERNS = [
+        (
+            re.compile(r'\bpython3?\s+-m\s+pptx\b'),
+            "Error: `python -m pptx` is not valid — pptx is a library, not a CLI tool. "
+            "Write a Python script using `from pptx import Presentation` and run it with "
+            "`python3 script.py` or a heredoc."
+        ),
+        (
+            re.compile(r'(?<![3])python\s'),  # bare `python ` without `python3`
+            None,  # None = let it run but post-process the "not found" error
+        ),
+    ]
+
     def execute(self) -> CommandResult:
         t0 = time.time()
+        cmd = self.args["command"]
+
+        # Pre-execution: block known-wrong patterns immediately
+        if re.search(r'\bpython3?\s+-m\s+pptx\b', cmd):
+            msg = (
+                "Error: `python -m pptx` is invalid — pptx is a library, not a CLI tool.\n"
+                "Write a Python script and run it:\n"
+                "  python3 << 'PYEOF'\n"
+                "  from pptx import Presentation\n"
+                "  prs = Presentation()\n"
+                "  slide = prs.slides.add_slide(prs.slide_layouts[1])\n"
+                "  slide.shapes.title.text = 'Title'\n"
+                "  slide.placeholders[1].text = 'Body text'\n"
+                "  prs.save('/path/to/output.pptx')\n"
+                "  print('Saved')\n"
+                "  PYEOF"
+            )
+            self.result = CommandResult(msg, False, time.time() - t0)
+            return self.result
+
         try:
             r = subprocess.run(
-                self.args["command"], shell=True,
+                cmd, shell=True,
                 capture_output=True, text=True, timeout=120, cwd=os.getcwd(),
             )
             out = r.stdout or ""
@@ -87,6 +121,9 @@ class RunBashCommand(ToolCommand):
                 out += ("\n--- stderr ---\n" + r.stderr) if out else r.stderr
             if r.returncode != 0:
                 out += f"\n[exit code: {r.returncode}]"
+            # Post-process: enrich "python: not found" errors
+            if "python: not found" in out or "python: command not found" in out:
+                out = "Error: `python` not found — use `python3` instead.\n" + out
             self.result = CommandResult(
                 self._truncate(out) or "(no output)",
                 r.returncode == 0, time.time() - t0, r.returncode,
@@ -105,12 +142,28 @@ class RunPythonCommand(ToolCommand):
         super().__init__(args)
         self.work_dir = work_dir
 
+    # Detects large inline string literals that are almost certainly pasted file content
+    _INLINE_DATA_RE = re.compile(r"('''|\"\"\")(.{200,}?)\1", re.DOTALL)
+
     def execute(self) -> CommandResult:
         t0 = time.time()
         script = self.args["script"]
         # Strip markdown code fences that LLMs often include
         script = re.sub(r'^```(?:python)?\s*\n?', '', script)
         script = re.sub(r'\n?```\s*$', '', script)
+
+        # Guard: reject scripts that hardcode large data blobs inline.
+        # The model should always read from the file instead.
+        if self._INLINE_DATA_RE.search(script):
+            msg = (
+                "Error: script contains a large inline string literal — "
+                "do not hardcode data in scripts. "
+                f"Read from the file instead:\n"
+                f"  with open('{self.work_dir}/user_input.txt') as f:\n"
+                f"      text = f.read()"
+            )
+            self.result = CommandResult(msg, False, time.time() - t0)
+            return self.result
         script_path = os.path.join(self.work_dir, "_script.py")
         try:
             with open(script_path, "w") as f:
