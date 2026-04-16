@@ -281,18 +281,18 @@ def _spin(stop_event: threading.Event) -> None:
 
 
 def _normalize_openai_response(msg: dict) -> dict:
-    """Convert OpenAI chat response message to Ollama-compatible format.
+    """Convert OpenAI chat response message to internal format.
 
-    Key differences:
-    - OpenAI tool call arguments are a JSON *string*; Ollama uses a dict.
-    - OpenAI tool calls carry an `id` field needed for tool result messages.
-    - OpenAI may return content=None when only tool calls are present.
+    - Arguments JSON string → dict
+    - Preserves tool call `id` for pairing with tool result messages
+    - Keeps content as None when absent (tool-call-only responses)
     """
-    result: dict = {
-        "role": msg.get("role", "assistant"),
-        "content": msg.get("content") or "",
-    }
     raw_tcs = msg.get("tool_calls")
+    result: dict = {"role": msg.get("role", "assistant")}
+
+    content = msg.get("content")          # may be None for tool-call-only turns
+    result["content"] = content or ""     # empty string for internal use
+
     if raw_tcs:
         normalized = []
         for tc in raw_tcs:
@@ -304,11 +304,32 @@ def _normalize_openai_response(msg: dict) -> dict:
                 except Exception:
                     args = {}
             normalized.append({
-                "id": tc.get("id", ""),       # preserved for tool result messages
+                "id": tc.get("id", ""),
                 "function": {"name": func.get("name", ""), "arguments": args},
             })
         result["tool_calls"] = normalized
     return result
+
+
+def _prepare_messages_for_openai(messages: list[dict]) -> list[dict]:
+    """Sanitize the message list before sending to OpenAI.
+
+    OpenAI rejects:
+    - assistant messages with tool_calls AND content="" (must be null/absent)
+    - tool messages missing tool_call_id when a preceding assistant had tool_calls
+    """
+    out = []
+    for msg in messages:
+        m = dict(msg)
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls") and not m.get("content"):
+            m.pop("content", None)   # null content required, not ""
+        if role == "tool" and "tool_call_id" not in m:
+            # If we lost the id (e.g. from context compression), add a placeholder
+            # so the API doesn't reject the whole request
+            m["tool_call_id"] = "unknown"
+        out.append(m)
+    return out
 
 
 def _chat_openai(messages: list[dict], use_tools: bool) -> dict:
@@ -318,7 +339,7 @@ def _chat_openai(messages: list[dict], use_tools: bool) -> dict:
     }
     payload: dict = {
         "model": MODEL,
-        "messages": messages,
+        "messages": _prepare_messages_for_openai(messages),
     }
     if use_tools:
         payload["tools"] = TOOLS

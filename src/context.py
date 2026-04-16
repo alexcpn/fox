@@ -126,10 +126,13 @@ def compress_tool_results(
                     if tcs:
                         tool_name = tcs[-1].get("function", {}).get("name", "tool")
                     break
-            result.append({
+            compressed: dict = {
                 "role": "tool",
                 "content": one_line_tool_summary(tool_name, msg.get("content", "")),
-            })
+            }
+            if msg.get("tool_call_id"):
+                compressed["tool_call_id"] = msg["tool_call_id"]
+            result.append(compressed)
         else:
             result.append(msg)
 
