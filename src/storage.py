@@ -44,9 +44,15 @@ class Storage:
                 created_at   DOUBLE,
                 completed_at DOUBLE,
                 result       VARCHAR,
-                error        VARCHAR
+                error        VARCHAR,
+                intent_json  VARCHAR
             )
         """)
+        # Backfill intent_json column if upgrading from an older schema
+        try:
+            self.conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS intent_json VARCHAR")
+        except Exception:
+            pass
         self.conn.execute("""
             CREATE SEQUENCE IF NOT EXISTS trans_seq START 1
         """)
@@ -133,8 +139,15 @@ class Storage:
         parent_id: Optional[str] = None,
     ):
         self.conn.execute(
-            "INSERT INTO tasks VALUES (?, ?, ?, ?, 'PENDING', ?, NULL, NULL, NULL)",
+            "INSERT INTO tasks (task_id, session_id, parent_id, description, state, created_at) "
+            "VALUES (?, ?, ?, ?, 'PENDING', ?)",
             [task_id, session_id, parent_id, description, time.time()],
+        )
+
+    def set_task_intent(self, task_id: str, intent_json: str):
+        self.conn.execute(
+            "UPDATE tasks SET intent_json=? WHERE task_id=?",
+            [intent_json, task_id],
         )
 
     def update_task_state(

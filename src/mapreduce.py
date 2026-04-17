@@ -3,6 +3,7 @@ Fox MapReduce orchestrator — routes queries to either a single state machine
 (simple) or a full map->execute->reduce pipeline (complex).
 """
 
+import json
 import os
 import re
 import uuid
@@ -12,6 +13,7 @@ from src.states import TaskStateMachine
 from src.storage import Storage
 from src.commands import CommandRegistry
 from src.ollama import build_system_prompt
+from src.validator import extract_intent, validate, Intent
 
 
 # ── Data extraction ───────────────────────────────────────────────────────────
@@ -54,9 +56,59 @@ class MapReduceOrchestrator:
         messages: list[dict],
         data_file: Optional[str] = None,
     ) -> str:
+        # Extract success criteria up front (one LLM call).
+        intent = extract_intent(self.llm_fn, user_input)
+        if intent and intent.criteria:
+            print(f"  \033[36m🎯 Intent: {intent.summary}\033[0m")
+            for c in intent.criteria:
+                print(f"  \033[90m   · {c.type}: {c.args}\033[0m")
+        self._current_intent = intent  # stashed for _run_single / _run_mapreduce to persist
+
         if not self.should_decompose(user_input):
-            return self._run_single(user_input, messages, data_file)
-        return self._run_mapreduce(user_input, messages, data_file)
+            result = self._run_single(user_input, messages, data_file)
+        else:
+            result = self._run_mapreduce(user_input, messages, data_file)
+
+        # Validate — cheap file/keyword checks only (Phase 1).
+        if intent and intent.criteria:
+            ok, failures = validate(intent, result, self.work_dir)
+            if ok:
+                print(f"  \033[32m✓ intent satisfied\033[0m")
+            else:
+                print(f"  \033[33m⚠ intent NOT satisfied: {'; '.join(failures)}\033[0m")
+                result = self._retry_for_intent(
+                    user_input, messages, data_file, intent, failures, result,
+                )
+        return result
+
+    def _retry_for_intent(
+        self,
+        user_input: str,
+        messages: list[dict],
+        data_file: Optional[str],
+        intent: Intent,
+        failures: list[str],
+        prior_result: str,
+    ) -> str:
+        """One retry. Feed the failure reasons back and re-run as a single task."""
+        retry_prompt = (
+            f"Your previous response did not fulfill the request.\n"
+            f"Unmet criteria: {'; '.join(failures)}\n\n"
+            f"Original request: {user_input}\n\n"
+            f"Fix the missing parts now. Use run_bash or run_python — do not just describe."
+        )
+        print(f"  \033[36m↻ retrying with intent feedback\033[0m")
+        retry_result = self._run_single(retry_prompt, messages, data_file)
+
+        ok, failures2 = validate(intent, retry_result, self.work_dir)
+        if ok:
+            return retry_result
+        # Still failed — return a result that makes the failure visible.
+        print(f"  \033[31m✗ intent still unmet: {'; '.join(failures2)}\033[0m")
+        return (
+            f"[⚠ intent validation failed: {'; '.join(failures2)}]\n\n"
+            f"{retry_result or prior_result}"
+        )
 
     # ── Simple path ───────────────────────────────────────────────────────────
 
@@ -68,6 +120,9 @@ class MapReduceOrchestrator:
     ) -> str:
         task_id = f"task-{uuid.uuid4().hex[:8]}"
         self.storage.create_task(task_id, self.session_id, user_input)
+        intent = getattr(self, "_current_intent", None)
+        if intent and intent.criteria:
+            self.storage.set_task_intent(task_id, json.dumps(intent.to_dict()))
 
         content = user_input
         if data_file:
@@ -91,6 +146,9 @@ class MapReduceOrchestrator:
     ) -> str:
         parent_id = f"task-{uuid.uuid4().hex[:8]}"
         self.storage.create_task(parent_id, self.session_id, user_input)
+        intent = getattr(self, "_current_intent", None)
+        if intent and intent.criteria:
+            self.storage.set_task_intent(parent_id, json.dumps(intent.to_dict()))
 
         # MAP
         print(f"\n  \033[1;36m── MAP ──\033[0m")
