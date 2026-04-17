@@ -110,6 +110,24 @@ class TaskStateMachine:
         """
         from src.context import compress_context, smart_truncate
 
+        # Auto-inject top-1 playbook if a similar task succeeded before
+        try:
+            chains = storage.find_similar_chains(self.description, limit=1)
+            if chains and chains[0].get("score", 0) > 0.15:
+                chain = chains[0]
+                steps = " → ".join(
+                    f"{s['tool']}({list(s['args'].values())[0][:40] if s['args'] else ''})"
+                    for s in chain["steps"][:5]
+                )
+                hint = (
+                    f"[Playbook: a similar task \"{chain['description'][:60]}\" "
+                    f"succeeded with: {steps}. Follow this pattern.]"
+                )
+                messages.append({"role": "system", "content": hint})
+                print(f"  \033[36m📋 playbook injected (score={chain['score']})\033[0m")
+        except Exception:
+            pass  # never block task execution for playbook lookup
+
         self.transition(TaskState.EXECUTING, storage=storage)
 
         current_response: Optional[dict] = None
