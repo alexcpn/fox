@@ -71,7 +71,7 @@ class MapReduceOrchestrator:
 
         # Validate — cheap file/keyword checks only (Phase 1).
         if intent and intent.criteria:
-            ok, failures = validate(intent, result, self.work_dir)
+            ok, failures = validate(intent, result, self.work_dir, llm_fn=self.llm_fn)
             if ok:
                 print(f"  \033[32m✓ intent satisfied\033[0m")
             else:

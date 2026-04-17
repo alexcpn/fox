@@ -77,12 +77,14 @@ Criterion types:
 - file_exists: a file matching path_pattern (glob) must exist. min_bytes is an optional floor.
 - file_format: file must have correct magic bytes for format (pptx/xlsx/docx/pdf/png/jpg/zip).
 - output_contains: the final text response must include these keywords (case-insensitive).
+- semantic: a yes/no question about the response quality. question is a specific pass/fail check.
 
 Rules:
 - Include criteria ONLY for things explicitly requested. Do not invent.
 - For file creation: always pair file_exists (min_bytes 500 for binary, 10 for text) with file_format.
+- For questions/analysis: use one semantic criterion with a specific question.
 - Maximum 3 criteria. Use globs like "*.pptx" unless the user named a file.
-- For questions / explanations with no file output, return criteria: [].
+- For trivial requests (ls, simple questions), return criteria: [].
 """
 
 
@@ -166,23 +168,61 @@ def _check_output_contains(args: dict, output: str) -> Optional[str]:
     return None
 
 
+_SEMANTIC_JUDGE_PROMPT = """You are a strict pass/fail judge. Answer ONLY "PASS" or "FAIL: <short reason>".
+
+Question: {question}
+
+Response to evaluate:
+{output}
+
+Does the response adequately address the question? PASS or FAIL:"""
+
+
+def _check_semantic(args: dict, output: str, llm_fn) -> Optional[str]:
+    question = args.get("question", "")
+    if not question or not llm_fn:
+        return None
+    try:
+        response = llm_fn(
+            [{"role": "user", "content": _SEMANTIC_JUDGE_PROMPT.format(
+                question=question, output=(output or "")[:2000],
+            )}],
+            use_tools=False, think=False,
+        )
+        verdict = (response.get("content") or "").strip().upper()
+        if verdict.startswith("PASS"):
+            return None
+        # Extract reason after "FAIL:"
+        reason = verdict.replace("FAIL:", "").replace("FAIL", "").strip() or "did not pass semantic check"
+        return reason
+    except Exception as e:
+        return None  # skip on LLM failure — don't block tasks for judge errors
+
+
 _CHECKS = {
-    "file_exists":     lambda args, wd, out: _check_file_exists(args, wd),
-    "file_format":     lambda args, wd, out: _check_file_format(args, wd),
-    "output_contains": lambda args, wd, out: _check_output_contains(args, out),
+    "file_exists":     lambda args, wd, out, llm: _check_file_exists(args, wd),
+    "file_format":     lambda args, wd, out, llm: _check_file_format(args, wd),
+    "output_contains": lambda args, wd, out, llm: _check_output_contains(args, out),
+    "semantic":        lambda args, wd, out, llm: _check_semantic(args, out, llm),
 }
 
 
-def validate(intent: Intent, final_output: str, work_dir: str) -> tuple[bool, list[str]]:
-    """Run each criterion. Returns (all_passed, list_of_failure_reasons)."""
+def validate(
+    intent: Intent,
+    final_output: str,
+    work_dir: str,
+    llm_fn=None,
+) -> tuple[bool, list[str]]:
+    """Run each criterion. Returns (all_passed, list_of_failure_reasons).
+    llm_fn is only needed for 'semantic' criteria — pass None to skip them."""
     if not intent.criteria:
         return True, []
     failures: list[str] = []
     for c in intent.criteria:
         check = _CHECKS.get(c.type)
         if check is None:
-            continue  # unknown type — forward-compat
-        err = check(c.args, work_dir, final_output)
+            continue
+        err = check(c.args, work_dir, final_output, llm_fn)
         if err:
             failures.append(f"[{c.type}] {err}")
     return len(failures) == 0, failures

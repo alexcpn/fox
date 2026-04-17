@@ -197,6 +197,35 @@ class TestValidatorOutputContains(unittest.TestCase):
         self.assertIn("missing", err)
 
 
+class TestValidatorSemantic(unittest.TestCase):
+    def test_pass(self):
+        from src.validator import _check_semantic
+        def mock_llm(msgs, use_tools=False, think=False):
+            return {"content": "PASS"}
+        err = _check_semantic({"question": "Is this good?"}, "yes it is", mock_llm)
+        self.assertIsNone(err)
+
+    def test_fail(self):
+        from src.validator import _check_semantic
+        def mock_llm(msgs, use_tools=False, think=False):
+            return {"content": "FAIL: missing important details"}
+        err = _check_semantic({"question": "Is this complete?"}, "incomplete", mock_llm)
+        self.assertIsNotNone(err)
+        self.assertIn("missing", err.lower())
+
+    def test_skipped_without_llm(self):
+        from src.validator import _check_semantic
+        err = _check_semantic({"question": "anything"}, "output", None)
+        self.assertIsNone(err)
+
+    def test_skipped_in_validate_without_llm(self):
+        intent = Intent(summary="test", criteria=[
+            Criterion(type="semantic", args={"question": "Is this good?"})
+        ])
+        ok, failures = validate(intent, "anything", "/tmp")
+        self.assertTrue(ok)  # semantic skipped when no llm_fn
+
+
 class TestValidateEndToEnd(unittest.TestCase):
     def test_empty_criteria_passes(self):
         intent = Intent(summary="test", criteria=[])
