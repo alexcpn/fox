@@ -158,6 +158,7 @@ class MapReduceOrchestrator:
 
         # EXECUTE each subtask in isolation
         subtask_results: list[str] = []
+        subtask_failures = 0
         prev_results_file = os.path.join(self.work_dir, "previous_results.txt")
 
         for i, desc in enumerate(subtask_descriptions):
@@ -165,7 +166,6 @@ class MapReduceOrchestrator:
             sub_id = f"{parent_id}-sub{i+1}"
             self.storage.create_task(sub_id, self.session_id, desc, parent_id=parent_id)
 
-            # Write compact previous results for this subtask to read
             with open(prev_results_file, "w") as f:
                 f.write("\n---\n".join(subtask_results) if subtask_results else "(none yet)")
 
@@ -175,7 +175,22 @@ class MapReduceOrchestrator:
 
             self.storage.update_task_state(sub_id, sm.state.value, result=result)
             subtask_results.append(f"Subtask {i+1} ({desc}):\n{result}")
-            print(f"  \033[90m  ✓ subtask {i+1} done\033[0m")
+
+            if sm.state.value == "FAILED":
+                subtask_failures += 1
+                print(f"  \033[31m  ✗ subtask {i+1} FAILED\033[0m")
+            else:
+                print(f"  \033[90m  ✓ subtask {i+1} done\033[0m")
+
+        # Abort if majority of subtasks failed
+        total = len(subtask_descriptions)
+        if subtask_failures > total / 2:
+            msg = f"majority of subtasks failed ({subtask_failures}/{total})"
+            print(f"  \033[31m✗ {msg} — skipping reduce\033[0m")
+            self.storage.update_task_state(parent_id, "FAILED", error=msg)
+            messages.append({"role": "user", "content": user_input})
+            messages.append({"role": "assistant", "content": f"[FAILED: {msg}]"})
+            return f"[FAILED: {msg}]"
 
         # REDUCE
         print(f"\n  \033[1;36m── REDUCE ──\033[0m")
