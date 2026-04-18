@@ -116,7 +116,7 @@ class MapReduceOrchestrator:
             return result
 
         # Always plan first — two-pass CoT planner returns (intent, subtasks)
-        intent, subtask_descriptions = self._map_phase(user_input)
+        intent, subtask_descriptions = self._map_phase(user_input, data_file)
 
         # Fallback intent extraction when planner couldn't parse INTENT section
         if intent is None:
@@ -252,7 +252,7 @@ class MapReduceOrchestrator:
                 desc, data_file, prev_results_file,
                 step_index=i + 1, total_steps=total, plan_path=plan_path,
             )
-            sm = TaskStateMachine(task_id=sub_id, description=desc, max_turns=2)
+            sm = TaskStateMachine(task_id=sub_id, description=desc, max_turns=4)
             result = sm.run(
                 sub_messages, self.llm_fn, self.command_registry, self.storage, self.session_id
             )
@@ -273,7 +273,7 @@ class MapReduceOrchestrator:
                     step_index=i + 1, total_steps=total, plan_path=plan_path,
                 )
                 retry_sm = TaskStateMachine(
-                    task_id=retry_id, description=retry_desc, max_turns=2, retry_level=1,
+                    task_id=retry_id, description=retry_desc, max_turns=4, retry_level=1,
                 )
                 result = retry_sm.run(
                     retry_messages, self.llm_fn, self.command_registry, self.storage, self.session_id
@@ -331,7 +331,7 @@ class MapReduceOrchestrator:
         plan_text = response.get("content", "")
         return re.findall(r'^\s*\d+\.\s*(.+)$', plan_text, re.MULTILINE)
 
-    def _map_phase(self, user_input: str) -> tuple:
+    def _map_phase(self, user_input: str, data_file: Optional[str] = None) -> tuple:
         """
         Two-pass CoT planner with self-critique + few-shot from playbook.
         Returns (Optional[Intent], list[str] of subtask descriptions).
@@ -341,6 +341,7 @@ class MapReduceOrchestrator:
         Pre-flight: structural validation + one re-plan on failure.
         """
         tool_list = ", ".join(sorted(_TOOL_NAMES))
+        data_ref = data_file or os.path.join(self.work_dir, "user_input.txt")
 
         # Few-shot from playbook (story 10.3)
         example_block = ""
@@ -377,7 +378,9 @@ class MapReduceOrchestrator:
             "PLAN:\n"
             "1. <atomic step — one tool, exact input, exact output>\n"
             "2. ...\n"
-            f"(3–8 steps. Each step uses ONE tool from {{{tool_list}}}. No 'and'. No prose.)"
+            f"(3–8 steps. Each step uses ONE tool from {{{tool_list}}}. No 'and'. No prose.)\n\n"
+            f"IMPORTANT: The ONLY input file available is: {data_ref}\n"
+            f"Do NOT invent filenames. Every step that reads data must use: {data_ref}"
         )
         pass1_messages = [
             {"role": "system", "content": pass1_system},

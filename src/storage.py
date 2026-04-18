@@ -221,18 +221,35 @@ class Storage:
     def lookup_cached_tool_call(
         self, tool_name: str, args: dict, max_age: float = 300.0
     ) -> Optional[str]:
-        """Return cached output if a recent identical call exists, else None."""
+        """Return cached output if a recent identical call exists, else None.
+
+        For read_file: validates the file mtime hasn't changed since the cache was
+        written. A file modified after the cache entry was stored is a cache miss,
+        preventing stale reads when user_input.txt or previous_results.txt are
+        overwritten mid-session.
+        """
         if tool_name not in self._CACHEABLE:
             return None
         args_hash = self._args_hash(args)
         cutoff = time.time() - max_age
         row = self.conn.execute(
-            "SELECT output FROM tool_calls "
+            "SELECT output, timestamp FROM tool_calls "
             "WHERE tool_name=? AND args_hash=? AND timestamp >= ? AND success=true "
             "ORDER BY timestamp DESC LIMIT 1",
             [tool_name, args_hash, cutoff],
         ).fetchone()
-        return row[0] if row else None
+        if not row:
+            return None
+        cached_output, cached_at = row[0], row[1]
+        # For read_file: reject cache entry if the file was modified after it was cached
+        if tool_name == "read_file":
+            path = args.get("path", "")
+            try:
+                if os.path.getmtime(path) > cached_at:
+                    return None  # file changed — must re-read
+            except OSError:
+                pass  # file doesn't exist or permission error — let execute() handle it
+        return cached_output
 
     # ── Entity graph ──────────────────────────────────────────────────────────
 
