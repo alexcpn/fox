@@ -56,8 +56,9 @@ class TaskStateMachine:
     history:     list[Transition] = field(default_factory=list)
     result:      Optional[str] = None
     error:       Optional[str] = None
-    turn_count:  int = 0
-    max_turns:   int = 10
+    turn_count:   int = 0
+    max_turns:    int = 10
+    retry_level:  int = 0  # 0=normal, 1=same prompt, 2=+example, 3=+skeleton
     _tools_called: set = field(default_factory=set)  # tracks tool names used this task
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -127,6 +128,27 @@ class TaskStateMachine:
                 print(f"  \033[36m📋 playbook injected (score={chain['score']})\033[0m")
         except Exception:
             pass  # never block task execution for playbook lookup
+
+        # Progressive hint injection for retried subtasks (retry_level set by orchestrator)
+        if self.retry_level >= 3:
+            messages.append({
+                "role": "system",
+                "content": (
+                    'Use this exact structure, filling in only the arguments: '
+                    '{"name": "<tool>", "arguments": {...}}. '
+                    'Respond with the tool call, nothing else.'
+                ),
+            })
+        elif self.retry_level >= 2:
+            messages.append({
+                "role": "system",
+                "content": (
+                    'Example tool call: run_python({"script": '
+                    '"with open(\'x.csv\') as f:\\n'
+                    '    print(len(f.readlines()))\\n'
+                    'print(\'RESULT: done\')"})'
+                ),
+            })
 
         self.transition(TaskState.EXECUTING, storage=storage)
 

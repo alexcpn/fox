@@ -1,11 +1,14 @@
 """
 Fox MapReduce orchestrator — routes queries to either a single state machine
 (simple) or a full map->execute->reduce pipeline (complex).
+
+Epic 10: plan-first loop for small models. Always plan, then route on plan length.
 """
 
 import json
 import os
 import re
+import time as _time
 import uuid
 from typing import Optional
 
@@ -16,7 +19,16 @@ from src.ollama import build_system_prompt
 from src.validator import extract_intent, validate, Intent
 
 
-# ── Data extraction ───────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+# Tools available for planning (subset of _COMMAND_MAP — excludes search_examples)
+_TOOL_NAMES = {"run_bash", "run_python", "read_file", "write_file", "grep_search", "list_files"}
+
+# Compiled regex for RESULT: line extraction
+_RESULT_RE = re.compile(r'^RESULT:\s*(.+?)\s*$', re.MULTILINE)
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
 
 def save_user_input(user_input: str, work_dir: str) -> Optional[str]:
     """Save multi-line input (3+ lines) to work_dir/user_input.txt. Returns path or None."""
@@ -28,6 +40,41 @@ def save_user_input(user_input: str, work_dir: str) -> Optional[str]:
         f.write(user_input)
     print(f"  \033[36m📎 Saved input → {path} ({len(lines)} lines)\033[0m")
     return path
+
+
+def _extract_result(text: str) -> str:
+    """Extract the last RESULT: line value, or fall back to last non-empty line."""
+    matches = _RESULT_RE.findall(text or "")
+    if matches:
+        return matches[-1].strip()
+    lines = [l for l in (text or "").strip().splitlines() if l.strip()]
+    return lines[-1][:200] if lines else ""
+
+
+def _validate_plan_structural(steps: list) -> tuple:
+    """Every step must mention at least one tool name. Returns (ok, failure_reasons)."""
+    failures = []
+    for i, step in enumerate(steps, 1):
+        lowered = step.lower()
+        if not any(tn in lowered for tn in _TOOL_NAMES):
+            failures.append(f"step {i} mentions no tool: {step[:80]}")
+    return (len(failures) == 0, failures)
+
+
+def _parse_intent_from_plan(text: str) -> Optional[Intent]:
+    """Extract INTENT JSON block from planner output. Returns Intent or None on failure."""
+    try:
+        # Try multiline JSON block after INTENT:\n
+        m = re.search(r'INTENT:\s*\n(\{.*?\})', text, re.DOTALL)
+        if not m:
+            # Try inline JSON on same line as INTENT:
+            m = re.search(r'INTENT:\s*(\{.*?\})', text, re.DOTALL)
+        if not m:
+            return None
+        data = json.loads(m.group(1))
+        return Intent.from_dict(data)
+    except Exception:
+        return None
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -47,32 +94,47 @@ class MapReduceOrchestrator:
         self.session_id       = session_id
         self.work_dir         = work_dir
 
+    def should_plan(self, user_input: str) -> bool:
+        """Skip planning only for trivial one-liners (≤30 chars)."""
+        return len(user_input.strip()) > 30
+
+    # Deprecated alias kept for any external callers
     def should_decompose(self, user_input: str) -> bool:
-        return len(user_input.strip().splitlines()) >= 5
+        return self.should_plan(user_input)
 
     def execute(
         self,
         user_input: str,
-        messages: list[dict],
+        messages: list,
         data_file: Optional[str] = None,
     ) -> str:
-        import time as _time
-
-        # Extract success criteria up front (one LLM call).
         task_started = _time.time()
-        intent = extract_intent(self.llm_fn, user_input)
+
+        # Skip planning for trivial one-liners
+        if not self.should_plan(user_input):
+            result = self._run_single(user_input, messages, data_file)
+            return result
+
+        # Always plan first — two-pass CoT planner returns (intent, subtasks)
+        intent, subtask_descriptions = self._map_phase(user_input)
+
+        # Fallback intent extraction when planner couldn't parse INTENT section
+        if intent is None:
+            intent = extract_intent(self.llm_fn, user_input)
+
         if intent and intent.criteria:
             print(f"  \033[36m🎯 Intent: {intent.summary}\033[0m")
             for c in intent.criteria:
                 print(f"  \033[90m   · {c.type}: {c.args}\033[0m")
-        self._current_intent = intent  # stashed for _run_single / _run_mapreduce to persist
+        self._current_intent = intent
 
-        if not self.should_decompose(user_input):
+        # Route based on plan length
+        if not subtask_descriptions or len(subtask_descriptions) <= 1:
             result = self._run_single(user_input, messages, data_file)
         else:
-            result = self._run_mapreduce(user_input, messages, data_file)
+            result = self._run_mapreduce(user_input, messages, data_file, subtask_descriptions)
 
-        # Validate — only files created *during this task* count.
+        # Validate against intent criteria
         if intent and intent.criteria:
             ok, failures = validate(
                 intent, result, self.work_dir,
@@ -83,18 +145,17 @@ class MapReduceOrchestrator:
             else:
                 print(f"  \033[33m⚠ intent NOT satisfied: {'; '.join(failures)}\033[0m")
                 result = self._retry_for_intent(
-                    user_input, messages, data_file, intent, failures, result,
-                    task_started,
+                    user_input, messages, data_file, intent, failures, result, task_started,
                 )
         return result
 
     def _retry_for_intent(
         self,
         user_input: str,
-        messages: list[dict],
+        messages: list,
         data_file: Optional[str],
         intent: Intent,
-        failures: list[str],
+        failures: list,
         prior_result: str,
         started_at: float = 0,
     ) -> str:
@@ -114,7 +175,6 @@ class MapReduceOrchestrator:
         )
         if ok:
             return retry_result
-        # Still failed — return a result that makes the failure visible.
         print(f"  \033[31m✗ intent still unmet: {'; '.join(failures2)}\033[0m")
         return (
             f"[⚠ intent validation failed: {'; '.join(failures2)}]\n\n"
@@ -126,7 +186,7 @@ class MapReduceOrchestrator:
     def _run_single(
         self,
         user_input: str,
-        messages: list[dict],
+        messages: list,
         data_file: Optional[str],
     ) -> str:
         task_id = f"task-{uuid.uuid4().hex[:8]}"
@@ -152,8 +212,9 @@ class MapReduceOrchestrator:
     def _run_mapreduce(
         self,
         user_input: str,
-        messages: list[dict],
+        messages: list,
         data_file: Optional[str],
+        subtask_descriptions: list,
     ) -> str:
         parent_id = f"task-{uuid.uuid4().hex[:8]}"
         self.storage.create_task(parent_id, self.session_id, user_input)
@@ -161,31 +222,68 @@ class MapReduceOrchestrator:
         if intent and intent.criteria:
             self.storage.set_task_intent(parent_id, json.dumps(intent.to_dict()))
 
-        # MAP
-        print(f"\n  \033[1;36m── MAP ──\033[0m")
-        subtask_descriptions = self._map_phase(user_input)
-        if not subtask_descriptions:
-            return self._run_single(user_input, messages, data_file)
+        total = len(subtask_descriptions)
+
+        # Persist plan as work-dir artifact so each subtask can reference it
+        plan_path = os.path.join(self.work_dir, "plan.md")
+        with open(plan_path, "w") as f:
+            f.write(f"# Plan for: {user_input[:200]}\n\n")
+            for i, step in enumerate(subtask_descriptions, 1):
+                f.write(f"{i}. {step}\n")
+
+        print(f"\n  \033[1;36m── MAP ({total} steps) ──\033[0m")
 
         # EXECUTE each subtask in isolation
-        subtask_results: list[str] = []
+        subtask_results: list = []
+        result_values: list = []  # only extracted RESULT: values for previous_results.txt
         subtask_failures = 0
         prev_results_file = os.path.join(self.work_dir, "previous_results.txt")
 
         for i, desc in enumerate(subtask_descriptions):
-            print(f"\n  \033[1;36m── EXECUTE {i+1}/{len(subtask_descriptions)}: {desc[:80]} ──\033[0m")
+            print(f"\n  \033[1;36m── EXECUTE {i+1}/{total}: {desc[:80]} ──\033[0m")
             sub_id = f"{parent_id}-sub{i+1}"
             self.storage.create_task(sub_id, self.session_id, desc, parent_id=parent_id)
 
+            # Write only clean RESULT values — not raw output — as context for next step
             with open(prev_results_file, "w") as f:
-                f.write("\n---\n".join(subtask_results) if subtask_results else "(none yet)")
+                f.write("\n".join(result_values) if result_values else "(none yet)")
 
-            sub_messages = self._build_subtask_messages(desc, data_file, prev_results_file)
-            sm = TaskStateMachine(task_id=sub_id, description=desc, max_turns=5)
-            result = sm.run(sub_messages, self.llm_fn, self.command_registry, self.storage, self.session_id)
-
+            sub_messages = self._build_subtask_messages(
+                desc, data_file, prev_results_file,
+                step_index=i + 1, total_steps=total, plan_path=plan_path,
+            )
+            sm = TaskStateMachine(task_id=sub_id, description=desc, max_turns=2)
+            result = sm.run(
+                sub_messages, self.llm_fn, self.command_registry, self.storage, self.session_id
+            )
             self.storage.update_task_state(sub_id, sm.state.value, result=result)
-            subtask_results.append(f"Subtask {i+1} ({desc}):\n{result}")
+
+            # Per-step structural verification; one retry on failure
+            ok, reason = self._verify_step(desc, result)
+            if not ok:
+                print(f"  \033[33m  ⚠ step {i+1} verify failed: {reason} — retrying\033[0m")
+                retry_id = f"{sub_id}-retry"
+                retry_desc = (
+                    f"Previous attempt failed: {reason}. Fix exactly that problem and retry.\n\n"
+                    f"Original task: {desc}"
+                )
+                self.storage.create_task(retry_id, self.session_id, retry_desc, parent_id=parent_id)
+                retry_messages = self._build_subtask_messages(
+                    retry_desc, data_file, prev_results_file,
+                    step_index=i + 1, total_steps=total, plan_path=plan_path,
+                )
+                retry_sm = TaskStateMachine(
+                    task_id=retry_id, description=retry_desc, max_turns=2, retry_level=1,
+                )
+                result = retry_sm.run(
+                    retry_messages, self.llm_fn, self.command_registry, self.storage, self.session_id
+                )
+
+            extracted = _extract_result(result)
+            result_values.append(extracted)
+            subtask_results.append(
+                f"Subtask {i+1} ({desc}):\nRESULT: {extracted}\n(full output below)\n{result[:400]}"
+            )
 
             if sm.state.value == "FAILED":
                 subtask_failures += 1
@@ -193,8 +291,7 @@ class MapReduceOrchestrator:
             else:
                 print(f"  \033[90m  ✓ subtask {i+1} done\033[0m")
 
-        # Abort if majority of subtasks failed
-        total = len(subtask_descriptions)
+        # Abort if majority failed
         if subtask_failures > total / 2:
             msg = f"majority of subtasks failed ({subtask_failures}/{total})"
             print(f"  \033[31m✗ {msg} — skipping reduce\033[0m")
@@ -208,13 +305,14 @@ class MapReduceOrchestrator:
         final = self._reduce_phase(user_input, subtask_results)
 
         self.storage.update_task_state(parent_id, "COMPLETED", result=final)
-
-        # Add to main conversation for continuity
         messages.append({"role": "user", "content": user_input})
         messages.append({"role": "assistant", "content": final})
         return final
 
-    def _map_phase(self, user_input: str) -> list[str]:
+    # ── Planner ───────────────────────────────────────────────────────────────
+
+    def _map_phase_legacy(self, user_input: str) -> list:
+        """Original one-shot planner — kept for rollback. Returns list[str]."""
         plan_messages = [
             {
                 "role": "system",
@@ -231,38 +329,164 @@ class MapReduceOrchestrator:
         ]
         response = self.llm_fn(plan_messages, use_tools=False, think=False)
         plan_text = response.get("content", "")
-        print(f"\033[36m{plan_text}\033[0m")
         return re.findall(r'^\s*\d+\.\s*(.+)$', plan_text, re.MULTILINE)
+
+    def _map_phase(self, user_input: str) -> tuple:
+        """
+        Two-pass CoT planner with self-critique + few-shot from playbook.
+        Returns (Optional[Intent], list[str] of subtask descriptions).
+
+        Pass 1: emit INTENT + REASONING + PLAN with few-shot example if available.
+        Pass 2: self-critique — rewrite any step that lacks a tool name or I/O refs.
+        Pre-flight: structural validation + one re-plan on failure.
+        """
+        tool_list = ", ".join(sorted(_TOOL_NAMES))
+
+        # Few-shot from playbook (story 10.3)
+        example_block = ""
+        try:
+            chains = self.storage.find_similar_chains(user_input, limit=1)
+            if chains and chains[0].get("score", 0) > 0.15:
+                chain = chains[0]
+                example_lines = [f"Task: {chain['description'][:100]}", "Plan:"]
+                for j, step in enumerate(chain["steps"][:6], 1):
+                    arg_preview = (
+                        next(iter(step["args"].values()), "")[:60]
+                        if step["args"] else ""
+                    )
+                    example_lines.append(f"  {j}. {step['tool']}({arg_preview})")
+                example_block = (
+                    "EXAMPLE (past successful task):\n"
+                    + "\n".join(example_lines)
+                    + "\n\nNOW PLAN FOR THE NEW TASK:\n"
+                )
+        except Exception as e:
+            print(f"  \033[33m⚠ playbook lookup failed: {e}\033[0m")
+
+        # ── Pass 1: draft ─────────────────────────────────────────────────────
+        pass1_system = (
+            "You are a planner for a small-model agent. Output exactly three sections.\n\n"
+            "INTENT:\n"
+            "{\"summary\": \"<one line goal>\", \"criteria\": [<zero or more criterion objects>]}\n\n"
+            "Criterion schema (use only what the user explicitly asked for; for trivial tasks use []):\n"
+            "  {\"type\": \"file_exists\",     \"args\": {\"path_pattern\": \"*.pptx\", \"min_bytes\": 500}}\n"
+            "  {\"type\": \"file_format\",     \"args\": {\"path_pattern\": \"*.pptx\", \"format\": \"pptx\"}}\n"
+            "  {\"type\": \"output_contains\", \"args\": {\"keywords\": [\"word1\"]}}\n\n"
+            "REASONING:\n"
+            "<3-5 short lines. Identify: goal, inputs, intermediate values, outputs, the tool for each step.>\n\n"
+            "PLAN:\n"
+            "1. <atomic step — one tool, exact input, exact output>\n"
+            "2. ...\n"
+            f"(3–8 steps. Each step uses ONE tool from {{{tool_list}}}. No 'and'. No prose.)"
+        )
+        pass1_messages = [
+            {"role": "system", "content": pass1_system},
+            {"role": "user",   "content": example_block + user_input},
+        ]
+        print(f"  \033[90m🗺  planner pass 1...\033[0m")
+        response1 = self.llm_fn(pass1_messages, use_tools=False, think=False)
+        draft_text = response1.get("content", "")
+        print(f"\033[36m{draft_text[:400]}\033[0m")
+
+        # ── Pass 2: self-critique ─────────────────────────────────────────────
+        pass2_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Review this plan. For each step check:\n"
+                    f"  (a) Does it name exactly one tool from {{{tool_list}}}?\n"
+                    "  (b) Does it name the exact file or value it reads?\n"
+                    "  (c) Does it name the exact file or value it produces?\n\n"
+                    "If any step fails (a), (b), or (c) — rewrite it.\n"
+                    "If a step contains 'and' — split it into two steps.\n\n"
+                    "Output ONLY the corrected PLAN: section. No commentary."
+                ),
+            },
+            {"role": "user", "content": draft_text},
+        ]
+        print(f"  \033[90m🗺  planner pass 2 (critique)...\033[0m")
+        response2 = self.llm_fn(pass2_messages, use_tools=False, think=False)
+        critiqued_text = response2.get("content", "")
+
+        # Parse PLAN section from critiqued output; fall back to draft
+        plan_match = re.search(r'PLAN:\s*\n(.*)', critiqued_text, re.DOTALL)
+        plan_body = plan_match.group(1) if plan_match else critiqued_text
+        subtasks = re.findall(r'^\s*\d+\.\s*(.+)$', plan_body, re.MULTILINE)
+
+        if not subtasks:
+            plan_match2 = re.search(r'PLAN:\s*\n(.*)', draft_text, re.DOTALL)
+            plan_body2 = plan_match2.group(1) if plan_match2 else draft_text
+            subtasks = re.findall(r'^\s*\d+\.\s*(.+)$', plan_body2, re.MULTILINE)
+
+        # Parse INTENT from draft text
+        intent = _parse_intent_from_plan(draft_text)
+
+        # ── Pre-flight structural validation (story 10.6) ─────────────────────
+        ok, reasons = _validate_plan_structural(subtasks)
+        if not ok:
+            print(f"  \033[33m⚠ plan invalid: {'; '.join(reasons)} — re-planning once\033[0m")
+            replan_messages = [
+                {"role": "system", "content": pass1_system},
+                {
+                    "role": "user",
+                    "content": (
+                        user_input
+                        + f"\n\nPrevious plan was invalid: {'; '.join(reasons)}. "
+                        + f"Each step MUST mention one tool name from {{{tool_list}}}."
+                    ),
+                },
+            ]
+            r3 = self.llm_fn(replan_messages, use_tools=False, think=False)
+            replan_text = r3.get("content", "")
+            plan_match3 = re.search(r'PLAN:\s*\n(.*)', replan_text, re.DOTALL)
+            plan_body3 = plan_match3.group(1) if plan_match3 else replan_text
+            subtasks = re.findall(r'^\s*\d+\.\s*(.+)$', plan_body3, re.MULTILINE)
+            ok2, _ = _validate_plan_structural(subtasks)
+            if not ok2:
+                # Both attempts invalid — return empty so execute() falls back to _run_single
+                subtasks = []
+
+        return (intent, subtasks)
 
     def _build_subtask_messages(
         self,
         description: str,
         data_file: Optional[str],
         prev_results_file: str,
-    ) -> list[dict]:
+        step_index: int = 1,
+        total_steps: int = 1,
+        plan_path: Optional[str] = None,
+    ) -> list:
         """Fresh, isolated message list for one subtask."""
         system = build_system_prompt(self.work_dir)
         data_ref = data_file or "(no data file)"
+        plan_ref = f"Full plan is at {plan_path}." if plan_path else ""
         user_content = (
+            f"You are step {step_index} of {total_steps}. {plan_ref}\n\n"
             f"TASK: {description}\n\n"
             f"FILES YOU MUST USE:\n"
             f"  - Input data: {data_ref}\n"
-            f"  - Previous task results: {prev_results_file}\n\n"
+            f"  - Previous step results: {prev_results_file}\n\n"
             f"RULES:\n"
             f"- Read the input file with run_python. Do NOT invent filenames.\n"
             f"- Do NOT hardcode values. Parse from the file.\n"
-            f"- Print your results with print()."
+            f"- Call exactly ONE tool. Print the result. Then stop.\n"
+            f"- Print your results with print().\n\n"
+            f"OUTPUT FORMAT:\n"
+            f"Your final message MUST end with exactly one line:\n"
+            f"  RESULT: <value>\n"
+            f"Where <value> is the direct answer to this step (a number, filename, short string, or 'done').\n"
+            f"Do not add text after the RESULT line."
         )
         return [
             {"role": "system", "content": system},
             {"role": "user",   "content": user_content},
         ]
 
-    def _reduce_phase(self, user_input: str, subtask_results: list[str]) -> str:
+    def _reduce_phase(self, user_input: str, subtask_results: list) -> str:
         """TF-IDF ranked synthesis — top results in full, rest as one-liners."""
         from src.relevance import rank_results_for_query
 
-        # Score each subtask result against the original query
         result_docs = [
             {"id": str(i), "text": r}
             for i, r in enumerate(subtask_results)
@@ -270,8 +494,7 @@ class MapReduceOrchestrator:
         ranked = rank_results_for_query(user_input, result_docs, top_k=2)
         top_ids = {r["id"] for r in ranked}
 
-        # Build reduce payload: top results in full (≤500 chars), rest as summaries
-        parts: list[str] = []
+        parts: list = []
         for i, r in enumerate(subtask_results):
             if str(i) in top_ids:
                 parts.append(r[:500])
@@ -298,3 +521,24 @@ class MapReduceOrchestrator:
         ]
         response = self.llm_fn(synth_messages, use_tools=False, think=False)
         return response.get("content", "(no synthesis)")
+
+    def _verify_step(self, desc: str, result: str) -> tuple:
+        """
+        Structural check only — no LLM judge.
+        Returns (ok, reason). Checks for RESULT: line and expected file side-effects.
+        """
+        if not _RESULT_RE.search(result or ""):
+            return False, "output missing 'RESULT:' line"
+        # If step mentions a write-type action + a filename, check the file exists.
+        # No trailing \b so write_file also triggers the check.
+        if re.search(r'(write_file|write|create|save|generate)', desc, re.I):
+            paths = re.findall(
+                r'([\w./-]+\.(?:py|txt|csv|md|json|html|pptx|xlsx|pdf|png))', desc
+            )
+            for p in paths:
+                candidate = p if os.path.isabs(p) else os.path.join(self.work_dir, p)
+                if not os.path.exists(candidate) and not os.path.exists(
+                    os.path.join(os.getcwd(), p)
+                ):
+                    return False, f"expected file {p} not created"
+        return True, ""
