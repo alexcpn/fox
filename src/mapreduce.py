@@ -56,7 +56,10 @@ class MapReduceOrchestrator:
         messages: list[dict],
         data_file: Optional[str] = None,
     ) -> str:
+        import time as _time
+
         # Extract success criteria up front (one LLM call).
+        task_started = _time.time()
         intent = extract_intent(self.llm_fn, user_input)
         if intent and intent.criteria:
             print(f"  \033[36m🎯 Intent: {intent.summary}\033[0m")
@@ -69,15 +72,19 @@ class MapReduceOrchestrator:
         else:
             result = self._run_mapreduce(user_input, messages, data_file)
 
-        # Validate — cheap file/keyword checks only (Phase 1).
+        # Validate — only files created *during this task* count.
         if intent and intent.criteria:
-            ok, failures = validate(intent, result, self.work_dir, llm_fn=self.llm_fn)
+            ok, failures = validate(
+                intent, result, self.work_dir,
+                llm_fn=self.llm_fn, started_at=task_started,
+            )
             if ok:
                 print(f"  \033[32m✓ intent satisfied\033[0m")
             else:
                 print(f"  \033[33m⚠ intent NOT satisfied: {'; '.join(failures)}\033[0m")
                 result = self._retry_for_intent(
                     user_input, messages, data_file, intent, failures, result,
+                    task_started,
                 )
         return result
 
@@ -89,6 +96,7 @@ class MapReduceOrchestrator:
         intent: Intent,
         failures: list[str],
         prior_result: str,
+        started_at: float = 0,
     ) -> str:
         """One retry. Feed the failure reasons back and re-run as a single task."""
         retry_prompt = (
@@ -100,7 +108,10 @@ class MapReduceOrchestrator:
         print(f"  \033[36m↻ retrying with intent feedback\033[0m")
         retry_result = self._run_single(retry_prompt, messages, data_file)
 
-        ok, failures2 = validate(intent, retry_result, self.work_dir)
+        ok, failures2 = validate(
+            intent, retry_result, self.work_dir,
+            llm_fn=self.llm_fn, started_at=started_at,
+        )
         if ok:
             return retry_result
         # Still failed — return a result that makes the failure visible.

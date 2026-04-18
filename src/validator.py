@@ -114,24 +114,29 @@ def extract_intent(llm_fn, user_input: str) -> Optional[Intent]:
 
 # ── Validation checks ─────────────────────────────────────────────────────────
 
-def _resolve_paths(pattern: str, work_dir: str) -> list[str]:
-    """Resolve a glob against work_dir, then cwd. Absolute patterns pass through."""
+def _resolve_paths(pattern: str, work_dir: str, created_after: float = 0) -> list[str]:
+    """Resolve a glob against work_dir, then cwd.
+    Only returns files modified after `created_after` (epoch seconds).
+    This prevents stale files from prior runs from causing false positives."""
     if os.path.isabs(pattern):
-        return glob.glob(pattern)
-    hits = glob.glob(os.path.join(work_dir, pattern))
-    if not hits:
-        hits = glob.glob(os.path.join(os.getcwd(), pattern))
+        hits = glob.glob(pattern)
+    else:
+        hits = glob.glob(os.path.join(work_dir, pattern))
+        if not hits:
+            hits = glob.glob(os.path.join(os.getcwd(), pattern))
+    if created_after > 0:
+        hits = [h for h in hits if os.path.getmtime(h) >= created_after]
     return hits
 
 
-def _check_file_exists(args: dict, work_dir: str) -> Optional[str]:
+def _check_file_exists(args: dict, work_dir: str, created_after: float = 0) -> Optional[str]:
     pattern = args.get("path_pattern", "")
     if not pattern:
         return None
     min_bytes = int(args.get("min_bytes", 0))
-    matches = _resolve_paths(pattern, work_dir)
+    matches = _resolve_paths(pattern, work_dir, created_after)
     if not matches:
-        return f"no file matching {pattern!r}"
+        return f"no file matching {pattern!r} (created during this task)"
     big_enough = [m for m in matches if os.path.getsize(m) >= min_bytes]
     if not big_enough:
         sizes = ", ".join(f"{os.path.basename(m)}={os.path.getsize(m)}B" for m in matches)
@@ -139,13 +144,13 @@ def _check_file_exists(args: dict, work_dir: str) -> Optional[str]:
     return None
 
 
-def _check_file_format(args: dict, work_dir: str) -> Optional[str]:
+def _check_file_format(args: dict, work_dir: str, created_after: float = 0) -> Optional[str]:
     pattern = args.get("path_pattern", "")
     fmt = args.get("format", "").lower()
     magic = _MAGIC.get(fmt)
     if not pattern or not magic:
         return None
-    matches = _resolve_paths(pattern, work_dir)
+    matches = _resolve_paths(pattern, work_dir, created_after)
     if not matches:
         return f"no file to format-check: {pattern!r}"
     for m in matches:
@@ -199,30 +204,34 @@ def _check_semantic(args: dict, output: str, llm_fn) -> Optional[str]:
         return None  # skip on LLM failure — don't block tasks for judge errors
 
 
-_CHECKS = {
-    "file_exists":     lambda args, wd, out, llm: _check_file_exists(args, wd),
-    "file_format":     lambda args, wd, out, llm: _check_file_format(args, wd),
-    "output_contains": lambda args, wd, out, llm: _check_output_contains(args, out),
-    "semantic":        lambda args, wd, out, llm: _check_semantic(args, out, llm),
-}
-
-
 def validate(
     intent: Intent,
     final_output: str,
     work_dir: str,
     llm_fn=None,
+    started_at: float = 0,
 ) -> tuple[bool, list[str]]:
     """Run each criterion. Returns (all_passed, list_of_failure_reasons).
-    llm_fn is only needed for 'semantic' criteria — pass None to skip them."""
+
+    llm_fn: only needed for 'semantic' criteria — pass None to skip them.
+    started_at: epoch timestamp — only files modified after this count.
+                Prevents stale files from prior runs causing false positives.
+    """
     if not intent.criteria:
         return True, []
     failures: list[str] = []
     for c in intent.criteria:
-        check = _CHECKS.get(c.type)
-        if check is None:
+        ctype = c.type
+        if ctype == "file_exists":
+            err = _check_file_exists(c.args, work_dir, started_at)
+        elif ctype == "file_format":
+            err = _check_file_format(c.args, work_dir, started_at)
+        elif ctype == "output_contains":
+            err = _check_output_contains(c.args, final_output)
+        elif ctype == "semantic":
+            err = _check_semantic(c.args, final_output, llm_fn)
+        else:
             continue
-        err = check(c.args, work_dir, final_output, llm_fn)
         if err:
             failures.append(f"[{c.type}] {err}")
     return len(failures) == 0, failures
