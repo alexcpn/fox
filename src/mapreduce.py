@@ -15,7 +15,8 @@ from typing import Optional
 from src.states import TaskStateMachine
 from src.storage import Storage
 from src.commands import CommandRegistry
-from src.ollama import build_system_prompt
+from src.ollama import build_system_prompt, chat_structured
+from src.schemas import Plan, PlanStep, Intent as SchemaIntent, StepResult
 from src.validator import extract_intent, validate, Intent
 
 
@@ -23,6 +24,9 @@ from src.validator import extract_intent, validate, Intent
 
 # Tools available for planning (subset of _COMMAND_MAP — excludes search_examples)
 _TOOL_NAMES = {"run_bash", "run_python", "read_file", "write_file", "grep_search", "list_files"}
+
+# Structured output enabled by default; set FOX_STRUCTURED_OUTPUT=0 to fall back to CoT regex
+_STRUCTURED_OUTPUT = os.environ.get("FOX_STRUCTURED_OUTPUT", "1") == "1"
 
 # Compiled regex for RESULT: line extraction
 _RESULT_RE = re.compile(r'^RESULT:\s*(.+?)\s*$', re.MULTILINE)
@@ -95,8 +99,17 @@ class MapReduceOrchestrator:
         self.work_dir         = work_dir
 
     def should_plan(self, user_input: str) -> bool:
-        """Skip planning only for trivial one-liners (≤30 chars)."""
-        return len(user_input.strip()) > 30
+        """Skip planning for trivial prompts and explicit single-tool requests."""
+        text = user_input.strip()
+        lowered = text.lower()
+        single_tool_hints = (
+            "do not decompose" in lowered or
+            "use exactly one run_python" in lowered or
+            "use a single run_python" in lowered
+        )
+        if single_tool_hints:
+            return False
+        return len(text) > 30
 
     # Deprecated alias kept for any external callers
     def should_decompose(self, user_input: str) -> bool:
@@ -333,12 +346,14 @@ class MapReduceOrchestrator:
 
     def _map_phase(self, user_input: str, data_file: Optional[str] = None) -> tuple:
         """
-        Two-pass CoT planner with self-critique + few-shot from playbook.
+        Planner: structured output path (default) + CoT fallback.
         Returns (Optional[Intent], list[str] of subtask descriptions).
 
-        Pass 1: emit INTENT + REASONING + PLAN with few-shot example if available.
-        Pass 2: self-critique — rewrite any step that lacks a tool name or I/O refs.
-        Pre-flight: structural validation + one re-plan on failure.
+        Structured path: single chat_structured(Plan) call — grammar-constrained,
+        every step guaranteed to have a valid tool name.
+
+        CoT fallback (FOX_STRUCTURED_OUTPUT=0 or on exception): two-pass text planner
+        with self-critique and pre-flight structural validation.
         """
         tool_list = ", ".join(sorted(_TOOL_NAMES))
         data_ref = data_file or os.path.join(self.work_dir, "user_input.txt")
@@ -363,6 +378,35 @@ class MapReduceOrchestrator:
                 )
         except Exception as e:
             print(f"  \033[33m⚠ playbook lookup failed: {e}\033[0m")
+
+        # ── Structured path (default) ─────────────────────────────────────────
+        if _STRUCTURED_OUTPUT:
+            system = (
+                "You are a task planner. Output a JSON plan matching the schema.\n\n"
+                "Rules:\n"
+                "- steps: 2–5 items. Each step calls exactly ONE tool.\n"
+                "- intent: one sentence summarising the user's goal.\n"
+                "- reasoning: think through the approach first.\n"
+                "- First step: read or parse input data.\n"
+                "- Last step: print or write the final result.\n"
+                f"- IMPORTANT: The ONLY input file available is: {data_ref}\n"
+                f"  Do NOT invent filenames. Use: {data_ref}\n"
+            )
+            user_msg = example_block + user_input
+            try:
+                print(f"  \033[90m🗺  structured planner...\033[0m")
+                plan: Plan = chat_structured(
+                    [{"role": "system", "content": system},
+                     {"role": "user",   "content": user_msg}],
+                    Plan,
+                )
+                intent = Intent.from_dict({"summary": plan.intent, "criteria": []})
+                subtasks = [f"{s.tool} {s.description}" for s in plan.steps]
+                print(f"  \033[36m📋 {len(subtasks)}-step plan: {plan.intent[:80]}\033[0m")
+                return (intent, subtasks)
+            except Exception as e:
+                print(f"  \033[33m⚠ structured plan failed ({e}), falling back to CoT\033[0m")
+                # Fall through to CoT path
 
         # ── Pass 1: draft ─────────────────────────────────────────────────────
         pass1_system = (

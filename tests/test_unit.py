@@ -899,6 +899,51 @@ class TestDecompositionGate(unittest.TestCase):
                     mock_single.assert_not_called()
 
 
+# ── Epic 13 Story 13.2 — structured _map_phase tests ─────────────────────────
+
+class TestStructuredMapPhase(unittest.TestCase):
+    def test_structured_plan_populates_subtasks(self):
+        import unittest.mock as mock
+        plan = Plan(
+            intent="count rows in employees.csv",
+            steps=[
+                PlanStep(tool="read_file", description="read employees.csv file"),
+                PlanStep(tool="run_python", description="count and print row total"),
+            ],
+        )
+        orch, _, _ = _make_orchestrator(["unused"])
+        with mock.patch("src.mapreduce._STRUCTURED_OUTPUT", True):
+            with mock.patch("src.mapreduce.chat_structured", return_value=plan):
+                intent, subtasks = orch._map_phase("count rows in employees.csv")
+        self.assertEqual(len(subtasks), 2)
+        self.assertIn("read_file", subtasks[0])
+        self.assertIn("run_python", subtasks[1])
+
+    def test_structured_plan_falls_back_on_exception(self):
+        import unittest.mock as mock
+        orch, _, call_log = _make_orchestrator([
+            "INTENT:\n{\"summary\":\"test\",\"criteria\":[]}\nREASONING:\nok\nPLAN:\n1. run_bash ls",
+            "PLAN:\n1. run_bash ls",
+        ])
+        with mock.patch("src.mapreduce._STRUCTURED_OUTPUT", True):
+            with mock.patch("src.mapreduce.chat_structured", side_effect=ValueError("schema fail")):
+                intent, subtasks = orch._map_phase("ls")
+        # Fell back to CoT — subtasks still populated
+        self.assertGreater(len(subtasks), 0)
+
+    def test_structured_output_disabled_skips_chat_structured(self):
+        import unittest.mock as mock
+        orch, _, _ = _make_orchestrator([
+            "INTENT:\n{\"summary\":\"test\",\"criteria\":[]}\nREASONING:\nok\nPLAN:\n1. run_bash ls",
+            "PLAN:\n1. run_bash ls",
+        ])
+        with mock.patch("src.mapreduce._STRUCTURED_OUTPUT", False):
+            with mock.patch("src.mapreduce.chat_structured") as mock_cs:
+                intent, subtasks = orch._map_phase("ls")
+                mock_cs.assert_not_called()
+        self.assertGreater(len(subtasks), 0)
+
+
 # ── Epic 12 tests ─────────────────────────────────────────────────────────────
 
 class TestFailureTaxonomy(unittest.TestCase):
