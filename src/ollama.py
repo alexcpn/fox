@@ -6,7 +6,10 @@ import json
 import os
 import time
 import threading
+from typing import TypeVar
 import requests
+
+_T = TypeVar("_T")
 
 OLLAMA_URL      = os.environ.get("OLLAMA_URL",        "http://localhost:11434")
 MODEL           = os.environ.get("OLLAMA_MODEL",       "gemma4")
@@ -31,6 +34,40 @@ def list_models() -> list[str]:
 
 
 _OPENAI_MODELS = ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
+
+
+def configure_backend_for_batch() -> tuple[str, str]:
+    """
+    Non-interactive backend selection for tests/batch runs.
+
+    Rules:
+    - FOX_BACKEND=openai|ollama forces the backend
+    - If unset and OPENAI_API_KEY is present, prefer OpenAI for batch runs
+    - FOX_MODEL overrides the model name for either backend
+    """
+    global MODEL, BACKEND, OPENAI_API_KEY
+
+    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", OPENAI_API_KEY)
+    requested_backend = os.environ.get("FOX_BACKEND", "").strip().lower()
+    requested_model = os.environ.get("FOX_MODEL", "").strip()
+
+    if requested_backend not in {"", "openai", "ollama"}:
+        raise ValueError(f"Invalid FOX_BACKEND={requested_backend!r}; use 'openai' or 'ollama'")
+
+    use_openai = requested_backend == "openai" or (
+        requested_backend == "" and bool(OPENAI_API_KEY)
+    )
+
+    if use_openai:
+        if not OPENAI_API_KEY:
+            raise ValueError("FOX_BACKEND=openai requires OPENAI_API_KEY")
+        BACKEND = "openai"
+        MODEL = requested_model or "gpt-4o-mini"
+    else:
+        BACKEND = "ollama"
+        MODEL = requested_model or os.environ.get("OLLAMA_MODEL", MODEL)
+
+    return BACKEND, MODEL
 
 
 def _pick_from_list(prompt: str, items: list[str]) -> str:
@@ -404,6 +441,67 @@ def _chat_ollama(messages: list[dict], use_tools: bool, think: bool) -> dict:
     resp = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=600)
     resp.raise_for_status()
     return resp.json()["message"]
+
+
+def chat_structured(
+    messages: list[dict],
+    schema: type[_T],
+    *,
+    think: bool = False,
+) -> _T:
+    """
+    Call the LLM and return a validated instance of `schema` (a Pydantic BaseModel).
+
+    Ollama: passes schema.model_json_schema() as `format` — llama.cpp constrains
+    token sampling to the grammar derived from the schema.
+
+    OpenAI: uses response_format with json_schema (non-strict, because
+    Criterion.args uses dict[str, Any] which strict mode cannot express).
+
+    Raises pydantic.ValidationError if output doesn't match the schema.
+    Raises json.JSONDecodeError if the model returns malformed JSON.
+    Callers should catch these and fall back to the legacy regex path.
+    """
+    from pydantic import BaseModel
+    import json as _json
+    if not issubclass(schema, BaseModel):
+        raise TypeError(f"schema must be a Pydantic BaseModel, got {schema}")
+
+    json_schema = schema.model_json_schema()
+
+    if BACKEND == "openai":
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload: dict = {
+            "model": MODEL,
+            "messages": _prepare_messages_for_openai(messages),
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema.__name__.lower(),
+                    "schema": json_schema,
+                    "strict": False,
+                },
+            },
+        }
+        resp = requests.post(OPENAI_URL, json=payload, headers=headers, timeout=120)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+    else:
+        payload = {
+            "model":    MODEL,
+            "messages": messages,
+            "stream":   False,
+            "think":    think,
+            "format":   json_schema,
+        }
+        resp = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=600)
+        resp.raise_for_status()
+        content = resp.json()["message"]["content"]
+
+    return schema.model_validate(_json.loads(content))
 
 
 def chat(messages: list[dict], use_tools: bool = True, think: bool = True) -> dict:

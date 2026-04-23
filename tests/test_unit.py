@@ -403,6 +403,78 @@ class TestSchemas(unittest.TestCase):
         self.assertEqual(sr.files_created, [])
 
 
+# ── Epic 13 Story 13.1 — chat_structured tests ────────────────────────────────
+
+class TestChatStructured(unittest.TestCase):
+    def _mock_ollama(self, body: dict):
+        import unittest.mock as mock
+        resp = mock.MagicMock()
+        resp.json.return_value = {"message": {"content": json.dumps(body)}}
+        resp.raise_for_status = mock.MagicMock()
+        return mock.patch("src.ollama.requests.post", return_value=resp)
+
+    def _mock_openai(self, body: dict):
+        import unittest.mock as mock
+        resp = mock.MagicMock()
+        resp.json.return_value = {"choices": [{"message": {"content": json.dumps(body)}}]}
+        resp.raise_for_status = mock.MagicMock()
+        return mock.patch("src.ollama.requests.post", return_value=resp)
+
+    def test_ollama_returns_validated_plan(self):
+        import src.ollama as ol
+        ol.BACKEND = "ollama"
+        payload = {
+            "intent": "count csv rows",
+            "reasoning": "read then count",
+            "steps": [
+                {"tool": "read_file", "description": "read employees.csv"},
+                {"tool": "run_python", "description": "count and print rows"},
+            ],
+        }
+        with self._mock_ollama(payload):
+            from src.ollama import chat_structured
+            plan = chat_structured([{"role": "user", "content": "plan"}], Plan)
+        self.assertIsInstance(plan, Plan)
+        self.assertEqual(len(plan.steps), 2)
+        self.assertEqual(plan.steps[0].tool, "read_file")
+
+    def test_openai_returns_validated_plan(self):
+        import src.ollama as ol
+        ol.BACKEND = "openai"
+        ol.OPENAI_API_KEY = "test-key"
+        payload = {
+            "intent": "list the files here",
+            "steps": [{"tool": "list_files", "description": "list the cwd files"}],
+        }
+        with self._mock_openai(payload):
+            from src.ollama import chat_structured
+            plan = chat_structured([{"role": "user", "content": "plan"}], Plan)
+        self.assertIsInstance(plan, Plan)
+        self.assertEqual(plan.steps[0].tool, "list_files")
+
+    def test_raises_on_schema_violation(self):
+        import src.ollama as ol
+        ol.BACKEND = "ollama"
+        from pydantic import ValidationError
+        payload = {"intent": "x", "steps": []}  # steps min_length=1
+        with self._mock_ollama(payload):
+            from src.ollama import chat_structured
+            with self.assertRaises(ValidationError):
+                chat_structured([{"role": "user", "content": "plan"}], Plan)
+
+    def test_raises_on_malformed_json(self):
+        import src.ollama as ol
+        import unittest.mock as mock
+        ol.BACKEND = "ollama"
+        resp = mock.MagicMock()
+        resp.json.return_value = {"message": {"content": "not json at all"}}
+        resp.raise_for_status = mock.MagicMock()
+        with mock.patch("src.ollama.requests.post", return_value=resp):
+            from src.ollama import chat_structured
+            with self.assertRaises(Exception):
+                chat_structured([{"role": "user", "content": "plan"}], Plan)
+
+
 # ── Epic 10 tests ─────────────────────────────────────────────────────────────
 
 from src.schemas import Plan, PlanStep, Intent, Criterion, StepResult
