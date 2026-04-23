@@ -1242,3 +1242,1020 @@ Every story is only Done when:
 Same as Epic 10, plus:
 - [ ] No story in Epic 11 introduces an LLM self-judge on a full answer. Structural checks only.
 - [ ] Each new env flag documented in CLAUDE.md under "Configuration".
+
+---
+
+## Epic 12 — Harness Self-Adaptation (Behavioural RLMF)
+
+**Goal**: Fox learns from its own execution history — not by updating model weights, but by adapting harness parameters (max_turns, retry_level starting point, hint strategy) based on what worked and what failed for similar tasks in the past.
+
+**Design constraint**: All reward signals must be structural/behavioural (completion, turn count, format conformance). No retrospective LLM self-judgment on output quality — unreliable for small models per Huang et al. 2024.
+
+---
+
+### Story 12.1 — Failure taxonomy: classify and persist failure modes
+
+**As a** developer debugging agent failures
+**I want** every FAILED task to record WHY it failed
+**So that** future runs can look up failure patterns and pre-arm against them.
+
+**Files to touch**: `src/storage.py`, `src/states.py`.
+
+**New DuckDB column** (migrate existing table):
+```sql
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS failure_mode VARCHAR;
+-- values: 'loop_detected' | 'max_turns' | 'empty_response' | 'bad_format' | 'llm_error' | 'tool_error'
+```
+
+**Failure mode classification** (in `states.py` — `_fail()` method):
+```python
+FAILURE_MODES = {
+    "loop detected":         "loop_detected",
+    "max turns":             "max_turns",
+    "empty LLM response":    "empty_response",
+    "LLM error":             "llm_error",
+}
+def _classify_failure(reason: str) -> str:
+    for keyword, mode in FAILURE_MODES.items():
+        if keyword.lower() in reason.lower():
+            return mode
+    return "tool_error"
+```
+
+**Edits**:
+1. `storage.py` — add `failure_mode` column to schema; update `update_task_state` to accept and persist it.
+2. `states.py` — `_fail()` calls `_classify_failure(reason)` and passes mode to `storage.update_task_state`.
+3. Add `storage.failure_histogram(description, limit=20) -> dict[str, int]` — TF-IDF lookup of similar past tasks, count failure modes.
+
+**Tests**:
+- `test_classify_failure_loop` — reason containing "loop detected" → `"loop_detected"`.
+- `test_classify_failure_max_turns` — `"max turns reached"` → `"max_turns"`.
+- `test_classify_failure_unknown` → `"tool_error"`.
+- `test_failure_mode_persisted` — mock storage; assert `update_task_state` called with correct `failure_mode`.
+
+**Definition of Done**:
+- [ ] `failure_mode` column present and populated for every FAILED task.
+- [ ] 4 unit tests pass.
+- [ ] `storage.failure_histogram("...")` returns a dict; no crash on empty DB.
+
+---
+
+### Story 12.2 — `harness_params` table: per-task-type learned parameters
+
+**As a** orchestrator
+**I want** a DuckDB table that records which harness parameters led to success for each task type
+**So that** future similar tasks start with a better configuration.
+
+**Files to touch**: `src/storage.py`.
+
+**New table**:
+```sql
+CREATE TABLE IF NOT EXISTS harness_params (
+    param_id       VARCHAR PRIMARY KEY,
+    task_hash      VARCHAR,      -- SHA256 of first 80 chars of description (lowercased, stripped)
+    description    VARCHAR,      -- human-readable label
+    max_turns      INTEGER,
+    retry_start    INTEGER,      -- retry_level to begin at (0, 1, or 2)
+    success_count  INTEGER DEFAULT 0,
+    failure_count  INTEGER DEFAULT 0,
+    avg_turns_used DOUBLE  DEFAULT 0.0,
+    updated_at     DOUBLE
+)
+```
+
+**New storage methods**:
+- `record_harness_outcome(task_id, description, max_turns, retry_start, turns_used, success: bool)` — upsert into `harness_params`; update `success_count`, `failure_count`, `avg_turns_used` (running average).
+- `lookup_harness_params(description) -> dict | None` — TF-IDF similarity search against `harness_params.description`; return row with best score > 0.15, or None.
+
+**Tests**:
+- `test_record_harness_outcome_new_entry` — first call creates row.
+- `test_record_harness_outcome_updates_counts` — second call with same hash increments `success_count`.
+- `test_lookup_harness_params_returns_none_on_empty_db`.
+- `test_avg_turns_used_running_average` — 3 runs with turns 4, 6, 2 → avg 4.0.
+
+**Definition of Done**:
+- [ ] Table schema present in `_init_schema`.
+- [ ] `record_harness_outcome` upserts correctly (no duplicate rows per task_hash).
+- [ ] `lookup_harness_params` returns None gracefully on empty DB.
+- [ ] 4 unit tests pass.
+
+---
+
+### Story 12.3 — Harness parameter priming at task start
+
+**As a** TaskStateMachine
+**I want** to look up learned harness parameters for the current task and apply them
+**So that** tasks similar to past failures start with a stronger configuration immediately.
+
+**Files to touch**: `src/states.py` (`run()`), `src/mapreduce.py` (`_run_single`, `_run_mapreduce`).
+
+**Logic** (insert after playbook injection, before `self.transition(EXECUTING)`):
+```python
+try:
+    hp = storage.lookup_harness_params(self.description)
+    if hp:
+        # If past similar tasks often failed with max_turns, give more room
+        if hp["failure_count"] > hp["success_count"] and "max_turns" in ...:
+            self.max_turns = min(self.max_turns + 2, 12)
+        # If past similar tasks needed retry_level >= 2 to succeed, pre-arm
+        if hp.get("retry_start", 0) > 0 and self.retry_level == 0:
+            self.retry_level = hp["retry_start"]
+            print(f"  \033[33m⚙  harness primed: max_turns={self.max_turns} retry_level={self.retry_level} (from history)\033[0m")
+except Exception:
+    pass  # never block on harness lookup
+```
+
+**Outcome recording** — at the end of `run()`, before returning:
+```python
+try:
+    storage.record_harness_outcome(
+        self.task_id, self.description,
+        max_turns=self.max_turns,
+        retry_start=self.retry_level,
+        turns_used=self.turn_count,
+        success=self.state == TaskState.COMPLETED,
+    )
+except Exception:
+    pass
+```
+
+**Tests**:
+- `test_harness_primed_from_history` — mock `lookup_harness_params` to return a row with `retry_start=2`; assert SM's `retry_level` is set to 2 before first LLM call.
+- `test_harness_not_primed_on_none` — mock returns None; assert retry_level stays 0.
+- `test_outcome_recorded_on_completion` — mock `record_harness_outcome`; run SM to COMPLETED; assert it was called with `success=True`.
+- `test_outcome_recorded_on_failure` — same for FAILED path.
+
+**Definition of Done**:
+- [ ] Harness priming block present and guarded by try/except.
+- [ ] Terminal prints `"⚙  harness primed: ..."` when priming fires.
+- [ ] Outcome recorded on both COMPLETED and FAILED.
+- [ ] 4 unit tests pass.
+
+---
+
+### Story 12.4 — Failure-mode-aware hint injection
+
+**As a** TaskStateMachine
+**I want** to pre-inject targeted hints based on the dominant failure mode for similar past tasks
+**So that** the model gets specific guidance instead of generic escalation.
+
+**Files to touch**: `src/states.py` (`run()`).
+
+**Failure-mode hint map**:
+```python
+_FAILURE_HINTS = {
+    "loop_detected": (
+        "Avoid repeating the same tool call. If you already read a file, "
+        "do not read it again — use the result you already have."
+    ),
+    "bad_format": (
+        "End your response with a line starting with RESULT: "
+        "followed by your answer. Example: RESULT: 42 records found."
+    ),
+    "empty_response": (
+        "You must respond with either a tool call or a final answer. "
+        "Do not return an empty response."
+    ),
+    "max_turns": (
+        "Be efficient. Combine steps where possible. "
+        "Aim to finish within 3 tool calls."
+    ),
+}
+```
+
+**Logic** (insert after harness priming, before EXECUTING transition):
+```python
+try:
+    hist = storage.failure_histogram(self.description)
+    dominant = max(hist, key=hist.get) if hist else None
+    if dominant and hist[dominant] >= 2 and dominant in _FAILURE_HINTS:
+        messages.append({"role": "system", "content": _FAILURE_HINTS[dominant]})
+        print(f"  \033[33m⚠  failure hint injected: {dominant} (seen {hist[dominant]}x)\033[0m")
+except Exception:
+    pass
+```
+
+**Tests**:
+- `test_failure_hint_injected_for_loop` — mock `failure_histogram` → `{"loop_detected": 3}`; assert hint message appended.
+- `test_failure_hint_not_injected_below_threshold` — count=1; assert no hint appended.
+- `test_failure_hint_not_injected_unknown_mode` — unknown mode key; assert no crash.
+- `test_failure_hint_picks_dominant` — `{"max_turns": 2, "loop_detected": 5}`; assert loop hint used.
+
+**Definition of Done**:
+- [ ] Hint injected only when dominant failure mode seen ≥ 2 times for similar tasks.
+- [ ] Terminal prints `"⚠  failure hint injected: {mode} (seen Nx)"`.
+- [ ] 4 unit tests pass.
+- [ ] Guard: try/except; never blocks task execution.
+
+---
+
+### Cross-cutting DoD for Epic 12
+
+- [ ] All reward signals are structural/behavioural — no LLM self-judgment on output quality.
+- [ ] All new storage methods guarded: never crash the agent on DB error.
+- [ ] New DuckDB tables/columns use `IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` — safe on existing DBs.
+- [ ] `backlog.md` stories 12.1 → 12.4 completed in order (each story's schema is a dependency for the next).
+- [ ] No new external dependencies introduced.
+
+---
+
+## Epic 13 — Pydantic Structured Output + OpenAI Backend Validation
+
+**Goal**: Replace all regex-based LLM output parsing with Pydantic schema-constrained calls. The LLM physically cannot produce a malformed plan or intent — the grammar or response_format contract enforces structure at the token level. Validate the implementation against OpenAI's structured outputs API as a correctness benchmark.
+
+**New dependency**: `pydantic>=2.0` — add to `requirements.txt` (or `pyproject.toml` if present).
+
+**New file**: `src/schemas.py` — single source of truth for all LLM output schemas.
+
+**Env flags introduced**:
+- `FOX_STRUCTURED_OUTPUT` — `"1"` (default) enables constrained decoding; `"0"` falls back to legacy regex parsing. Allows rollback if a model degrades under grammar constraints.
+
+**Implementation order**: 13.0 → 13.1 → 13.2 → 13.3 → 13.4 → 13.5. Each story's output is a dependency for the next. Commit after each story's tests pass.
+
+---
+
+### Story 13.0 — `src/schemas.py`: Pydantic model definitions
+
+**As a** developer
+**I want** a single file that defines all LLM output shapes as Pydantic models
+**So that** every parsing site imports from one place and breaking changes surface at import time.
+
+**Files to create**: `src/schemas.py`
+
+**File content** (implement exactly this):
+
+```python
+"""
+Fox Pydantic output schemas — single source of truth for all LLM-structured responses.
+Import these instead of writing ad-hoc dataclasses or regex parsers.
+"""
+
+from typing import Annotated, Any, Literal
+from pydantic import BaseModel, Field
+
+# ── Tool names ────────────────────────────────────────────────────────────────
+
+ToolName = Literal[
+    "run_bash", "run_python", "read_file",
+    "write_file", "grep_search", "list_files",
+]
+
+
+# ── Planning schemas ──────────────────────────────────────────────────────────
+
+class PlanStep(BaseModel):
+    tool: ToolName
+    description: str = Field(min_length=5, max_length=200)
+
+
+class Plan(BaseModel):
+    intent: str = Field(min_length=5, max_length=300)
+    reasoning: str = Field(default="", max_length=1000)
+    steps: list[PlanStep] = Field(min_length=1, max_length=6)
+
+
+# ── Intent / validation schemas ───────────────────────────────────────────────
+
+class Criterion(BaseModel):
+    type: str
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+class Intent(BaseModel):
+    summary: str = Field(default="", max_length=300)
+    criteria: list[Criterion] = Field(default_factory=list, max_length=5)
+
+    # ── Compat helpers so existing code (validator.py) keeps working ──────────
+    def to_dict(self) -> dict:
+        return {
+            "summary": self.summary,
+            "criteria": [{"type": c.type, "args": c.args} for c in self.criteria],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Intent":
+        return cls(
+            summary=d.get("summary", ""),
+            criteria=[
+                Criterion(type=c["type"], args=c.get("args", {}))
+                for c in d.get("criteria", [])
+                if "type" in c
+            ],
+        )
+
+
+# ── Step result schema ────────────────────────────────────────────────────────
+
+class StepResult(BaseModel):
+    result: str = Field(min_length=1, max_length=500,
+                        description="One-line summary of what was found or produced.")
+    files_created: list[str] = Field(
+        default_factory=list,
+        description="Paths of files created or written by this step.",
+    )
+```
+
+**Notes**:
+- `Plan.reasoning` is intentionally a free-text field — the model fills it before committing to `steps`, providing chain-of-thought within the structured call.
+- `Criterion.args` uses `dict[str, Any]` because criterion args vary by type. This means OpenAI strict mode cannot be used for `Intent` extraction — use non-strict `json_schema` format.
+- `Intent` keeps `to_dict()` / `from_dict()` so `src/validator.py` needs minimal changes.
+- `StepResult.files_created` lets `_verify_step` check files without regex-scanning the description.
+
+**Tests to add** (`tests/test_unit.py`, class `TestSchemas`):
+
+```python
+class TestSchemas(unittest.TestCase):
+    def test_plan_step_rejects_unknown_tool(self):
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            PlanStep(tool="analyze_data", description="do something")
+
+    def test_plan_step_accepts_valid_tool(self):
+        s = PlanStep(tool="run_python", description="count rows in csv")
+        self.assertEqual(s.tool, "run_python")
+
+    def test_plan_requires_at_least_one_step(self):
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            Plan(intent="do something", steps=[])
+
+    def test_plan_rejects_too_many_steps(self):
+        from pydantic import ValidationError
+        steps = [PlanStep(tool="run_bash", description=f"step {i}") for i in range(7)]
+        with self.assertRaises(ValidationError):
+            Plan(intent="do too much", steps=steps)
+
+    def test_intent_from_dict_roundtrip(self):
+        d = {"summary": "count rows", "criteria": [
+            {"type": "output_contains", "args": {"keywords": ["done"]}}
+        ]}
+        intent = Intent.from_dict(d)
+        self.assertEqual(intent.summary, "count rows")
+        self.assertEqual(intent.criteria[0].type, "output_contains")
+        self.assertEqual(intent.to_dict(), d)
+
+    def test_step_result_requires_nonempty_result(self):
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            StepResult(result="")
+
+    def test_step_result_files_created_defaults_empty(self):
+        sr = StepResult(result="42 rows found")
+        self.assertEqual(sr.files_created, [])
+```
+
+**Definition of Done**:
+- [ ] `src/schemas.py` exists and imports cleanly: `from src.schemas import Plan, PlanStep, Intent, Criterion, StepResult`
+- [ ] `pydantic` in `requirements.txt`
+- [ ] 7 unit tests in `TestSchemas` all pass
+- [ ] `python3 -c "from src.schemas import Plan, Intent, StepResult; print('ok')"` exits 0
+- [ ] Commit: `"Add src/schemas.py: Pydantic output models for Plan, Intent, StepResult"`
+
+---
+
+### Story 13.1 — `chat_structured()` in `src/ollama.py`
+
+**As a** planner / intent extractor
+**I want** a single function that calls the LLM and guarantees the output validates against a Pydantic schema
+**So that** every caller gets a typed Python object, never a parse error from a badly formatted string.
+
+**Files to touch**: `src/ollama.py`
+
+**Add after `chat()`**:
+
+```python
+def chat_structured(
+    messages: list[dict],
+    schema: type,          # a Pydantic BaseModel subclass
+    *,
+    think: bool = False,
+) -> object:
+    """
+    Call the LLM and return a validated instance of `schema`.
+
+    Ollama path: passes schema.model_json_schema() as the `format` field —
+    llama.cpp constrains token sampling to the grammar derived from the schema.
+
+    OpenAI path: uses response_format with json_schema (non-strict, because
+    Criterion.args uses dict[str, Any] which strict mode cannot express).
+
+    Raises pydantic.ValidationError if the model output doesn't match the schema
+    (can happen on very small models under grammar constraints). Callers should
+    catch this and fall back to the legacy regex path.
+    """
+    from pydantic import BaseModel
+    if not issubclass(schema, BaseModel):
+        raise TypeError(f"schema must be a Pydantic BaseModel, got {schema}")
+
+    json_schema = schema.model_json_schema()
+
+    if BACKEND == "openai":
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload: dict = {
+            "model": MODEL,
+            "messages": _prepare_messages_for_openai(messages),
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema.__name__.lower(),
+                    "schema": json_schema,
+                    "strict": False,
+                },
+            },
+        }
+        resp = requests.post(OPENAI_URL, json=payload, headers=headers, timeout=120)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+    else:
+        payload = {
+            "model":   MODEL,
+            "messages": messages,
+            "stream":  False,
+            "think":   think,
+            "format":  json_schema,
+        }
+        resp = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=600)
+        resp.raise_for_status()
+        content = resp.json()["message"]["content"]
+
+    import json as _json
+    return schema.model_validate(_json.loads(content))
+```
+
+**Tests to add** (`tests/test_unit.py`, class `TestChatStructured`):
+
+```python
+class TestChatStructured(unittest.TestCase):
+    def _mock_ollama(self, body: dict):
+        """Patch requests.post to return body as Ollama response."""
+        import unittest.mock as mock
+        import json
+        resp = mock.MagicMock()
+        resp.json.return_value = {"message": {"content": json.dumps(body)}}
+        resp.raise_for_status = mock.MagicMock()
+        return mock.patch("src.ollama.requests.post", return_value=resp)
+
+    def _mock_openai(self, body: dict):
+        import unittest.mock as mock
+        import json
+        resp = mock.MagicMock()
+        resp.json.return_value = {
+            "choices": [{"message": {"content": json.dumps(body)}}]
+        }
+        resp.raise_for_status = mock.MagicMock()
+        return mock.patch("src.ollama.requests.post", return_value=resp)
+
+    def test_ollama_returns_validated_plan(self):
+        import src.ollama as ol
+        ol.BACKEND = "ollama"
+        payload = {
+            "intent": "count csv rows",
+            "reasoning": "read then count",
+            "steps": [
+                {"tool": "read_file", "description": "read employees.csv"},
+                {"tool": "run_python", "description": "count and print rows"},
+            ],
+        }
+        with self._mock_ollama(payload):
+            from src.ollama import chat_structured
+            from src.schemas import Plan
+            plan = chat_structured([{"role": "user", "content": "plan"}], Plan)
+        self.assertIsInstance(plan, Plan)
+        self.assertEqual(len(plan.steps), 2)
+        self.assertEqual(plan.steps[0].tool, "read_file")
+
+    def test_openai_returns_validated_plan(self):
+        import src.ollama as ol
+        ol.BACKEND = "openai"
+        ol.OPENAI_API_KEY = "test-key"
+        payload = {
+            "intent": "list files",
+            "steps": [{"tool": "list_files", "description": "list the cwd"}],
+        }
+        with self._mock_openai(payload):
+            from src.ollama import chat_structured
+            from src.schemas import Plan
+            plan = chat_structured([{"role": "user", "content": "plan"}], Plan)
+        self.assertIsInstance(plan, Plan)
+        self.assertEqual(plan.steps[0].tool, "list_files")
+
+    def test_raises_on_schema_violation(self):
+        import src.ollama as ol
+        ol.BACKEND = "ollama"
+        from pydantic import ValidationError
+        payload = {"intent": "x", "steps": []}  # steps must be non-empty
+        with self._mock_ollama(payload):
+            from src.ollama import chat_structured
+            from src.schemas import Plan
+            with self.assertRaises(ValidationError):
+                chat_structured([{"role": "user", "content": "plan"}], Plan)
+
+    def test_raises_on_malformed_json(self):
+        import src.ollama as ol
+        ol.BACKEND = "ollama"
+        import unittest.mock as mock
+        resp = mock.MagicMock()
+        resp.json.return_value = {"message": {"content": "not json at all"}}
+        resp.raise_for_status = mock.MagicMock()
+        with mock.patch("src.ollama.requests.post", return_value=resp):
+            from src.ollama import chat_structured
+            from src.schemas import Plan
+            with self.assertRaises(Exception):  # json.JSONDecodeError
+                chat_structured([{"role": "user", "content": "plan"}], Plan)
+```
+
+**Definition of Done**:
+- [ ] `chat_structured` present in `src/ollama.py`, importable
+- [ ] Works for both `BACKEND="ollama"` and `BACKEND="openai"`
+- [ ] Returns a validated Pydantic instance, raises on bad output
+- [ ] 4 unit tests in `TestChatStructured` pass (mocked HTTP — no real LLM needed)
+- [ ] Commit: `"Add chat_structured(): constrained-decoding LLM call for both Ollama and OpenAI"`
+
+---
+
+### Story 13.2 — Update `_map_phase` to use structured plan output
+
+**As a** planner
+**I want** `_map_phase` to call `chat_structured(messages, Plan)` instead of parsing numbered lists with regex
+**So that** every step is guaranteed to contain a valid tool name — no pre-flight validation or re-plan fallback needed.
+
+**Files to touch**: `src/mapreduce.py`
+
+**New env guard** at top of file (add after imports):
+```python
+_STRUCTURED_OUTPUT = os.environ.get("FOX_STRUCTURED_OUTPUT", "1") == "1"
+```
+
+**New pass-1 system prompt** for structured mode (replace the `pass1_system` string in `_map_phase`):
+
+```
+You are a task planner. Output a JSON plan matching the schema provided.
+
+Rules:
+- steps: 2–5 items. Each step calls exactly ONE of:
+  run_bash | run_python | read_file | write_file | grep_search | list_files
+- intent: one sentence summarising the user's goal
+- reasoning: think through the approach before listing steps
+- First step: read/parse input data.
+- Last step: print or write the final result.
+- IMPORTANT: The ONLY input file available is: {data_ref}
+```
+
+**Updated `_map_phase` logic** (replace the current body, keeping the few-shot injection and playbook lookup):
+
+```python
+def _map_phase(self, user_input: str, data_file: str | None = None) -> tuple[Optional[Intent], list[str]]:
+    from src.ollama import chat_structured
+    from src.schemas import Plan
+
+    data_ref = data_file or os.path.join(self.work_dir, "user_input.txt")
+    
+    # Few-shot playbook injection (unchanged from current code)
+    few_shot = ""
+    try:
+        chains = self.storage.find_similar_chains(user_input, limit=1)
+        if chains and chains[0].get("score", 0) > 0.15:
+            chain = chains[0]
+            steps_text = "\n".join(
+                f"  {i+1}. {s['tool']}: {list(s['args'].values())[0][:60] if s['args'] else ''}"
+                for i, s in enumerate(chain["steps"][:5])
+            )
+            few_shot = (
+                f"\n\nEXAMPLE (past successful task): \"{chain['description'][:80]}\"\n"
+                f"Steps used:\n{steps_text}"
+            )
+    except Exception:
+        pass
+
+    # ── Structured path ────────────────────────────────────────────────────────
+    if _STRUCTURED_OUTPUT:
+        system = (
+            "You are a task planner. Output a JSON plan matching the schema provided.\n\n"
+            "Rules:\n"
+            "- steps: 2–5 items. Each step calls exactly ONE tool.\n"
+            "- intent: one sentence summarising the user's goal.\n"
+            "- reasoning: think through the approach first.\n"
+            "- First step: read or parse input data.\n"
+            "- Last step: print or write the final result.\n"
+            f"- IMPORTANT: The ONLY input file available is: {data_ref}\n"
+        )
+        user_msg = user_input + few_shot
+        try:
+            plan: Plan = chat_structured(
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": user_msg}],
+                Plan,
+            )
+            intent = Intent(summary=plan.intent)
+            subtasks = [f"{s.tool} {s.description}" for s in plan.steps]
+            print(f"  \033[90m🗺  structured plan: {len(subtasks)} steps\033[0m")
+            return intent, subtasks
+        except Exception as e:
+            print(f"  \033[33m⚠ structured plan failed ({e}), falling back to CoT\033[0m")
+            # Fall through to legacy CoT path
+
+    # ── Legacy CoT path (unchanged — keep as fallback) ─────────────────────────
+    # ... existing pass1/pass2 code unchanged ...
+```
+
+**Removal after structured path lands**:
+- `_validate_plan_structural()` becomes unreachable when `FOX_STRUCTURED_OUTPUT=1`; keep it for the `FOX_STRUCTURED_OUTPUT=0` fallback path. Do NOT delete it.
+- `_parse_intent_from_plan()` — same: keep for fallback.
+
+**Tests to add** (`tests/test_unit.py`, class `TestStructuredMapPhase`):
+
+```python
+class TestStructuredMapPhase(unittest.TestCase):
+    def test_structured_plan_populates_subtasks(self):
+        import unittest.mock as mock
+        from src.schemas import Plan, PlanStep
+        plan = Plan(
+            intent="count rows in employees.csv",
+            steps=[
+                PlanStep(tool="read_file", description="read employees.csv"),
+                PlanStep(tool="run_python", description="count and print rows"),
+            ],
+        )
+        orch, _, _ = _make_orchestrator(["unused"])
+        with mock.patch("src.mapreduce._STRUCTURED_OUTPUT", True):
+            with mock.patch("src.mapreduce.chat_structured", return_value=plan):
+                intent, subtasks = orch._map_phase("count rows in employees.csv")
+        self.assertEqual(len(subtasks), 2)
+        self.assertIn("read_file", subtasks[0])
+        self.assertIn("run_python", subtasks[1])
+
+    def test_structured_plan_falls_back_on_validation_error(self):
+        import unittest.mock as mock
+        from pydantic import ValidationError
+        orch, _, call_log = _make_orchestrator([
+            "INTENT:\n{\"summary\":\"test\",\"criteria\":[]}\nREASONING:\nok\nPLAN:\n1. run_bash ls",
+            "PLAN:\n1. run_bash ls",
+        ])
+        with mock.patch("src.mapreduce._STRUCTURED_OUTPUT", True):
+            with mock.patch("src.mapreduce.chat_structured", side_effect=ValueError("bad")):
+                intent, subtasks = orch._map_phase("ls")
+        # Fell back to CoT — subtasks still populated from legacy path
+        self.assertGreater(len(subtasks), 0)
+
+    def test_structured_output_disabled_uses_cot(self):
+        import unittest.mock as mock
+        orch, _, _ = _make_orchestrator([
+            "INTENT:\n{\"summary\":\"test\",\"criteria\":[]}\nREASONING:\nok\nPLAN:\n1. run_bash ls",
+            "PLAN:\n1. run_bash ls",
+        ])
+        with mock.patch("src.mapreduce._STRUCTURED_OUTPUT", False):
+            with mock.patch("src.mapreduce.chat_structured") as mock_cs:
+                intent, subtasks = orch._map_phase("ls")
+                mock_cs.assert_not_called()
+        self.assertGreater(len(subtasks), 0)
+```
+
+**Definition of Done**:
+- [ ] `_map_phase` calls `chat_structured(messages, Plan)` when `FOX_STRUCTURED_OUTPUT=1`
+- [ ] Falls back to legacy CoT path on any exception from `chat_structured`
+- [ ] Legacy path unchanged and reachable via `FOX_STRUCTURED_OUTPUT=0`
+- [ ] 3 unit tests in `TestStructuredMapPhase` pass
+- [ ] Existing `TestPreFlightValidation` tests still pass (they test the legacy path)
+- [ ] Commit: `"Use chat_structured(Plan) in _map_phase; CoT path kept as fallback"`
+
+---
+
+### Story 13.3 — Update `extract_intent` in `validator.py` to use structured output
+
+**As a** intent extractor
+**I want** `extract_intent` to call `chat_structured(messages, Intent)` instead of regex-cleaning JSON
+**So that** the validator always receives a properly typed `Intent` with validated `Criterion` list.
+
+**Files to touch**: `src/validator.py`
+
+**Update `extract_intent`** (replace current body):
+
+```python
+def extract_intent(llm_fn, user_input: str) -> Optional[Intent]:
+    """Single LLM call. Returns None on parse failure (skip validation)."""
+    import os as _os
+    structured = _os.environ.get("FOX_STRUCTURED_OUTPUT", "1") == "1"
+
+    if structured:
+        try:
+            from src.ollama import chat_structured
+            return chat_structured(
+                [
+                    {"role": "system", "content": _EXTRACT_SYSTEM},
+                    {"role": "user", "content": user_input},
+                ],
+                Intent,
+                think=False,
+            )
+        except Exception:
+            pass  # fall through to legacy path
+
+    # Legacy path — unchanged
+    try:
+        response = llm_fn(
+            [
+                {"role": "system", "content": _EXTRACT_SYSTEM},
+                {"role": "user", "content": user_input},
+            ],
+            use_tools=False, think=False,
+        )
+        content = (response.get("content") or "").strip()
+        content = re.sub(r'^```(?:json)?\s*', '', content)
+        content = re.sub(r'\s*```$', '', content)
+        m = re.search(r'\{.*\}', content, re.DOTALL)
+        if not m:
+            return None
+        data = json.loads(m.group(0))
+        return Intent.from_dict(data)
+    except Exception:
+        return None
+```
+
+**Also update `validator.py` imports**: replace the local `Criterion` and `Intent` dataclass definitions with imports from `src.schemas`:
+
+```python
+# DELETE these two @dataclass blocks from validator.py:
+# @dataclass class Criterion ...
+# @dataclass class Intent ...
+
+# ADD at the top of validator.py:
+from src.schemas import Criterion, Intent
+```
+
+**Tests to add** (`tests/test_unit.py`, class `TestStructuredIntent`):
+
+```python
+class TestStructuredIntent(unittest.TestCase):
+    def test_structured_extract_returns_intent(self):
+        import unittest.mock as mock
+        from src.schemas import Intent, Criterion
+        mock_intent = Intent(
+            summary="count rows",
+            criteria=[Criterion(type="output_contains", args={"keywords": ["done"]})]
+        )
+        with mock.patch("src.validator.FOX_STRUCTURED_OUTPUT_FLAG", True):
+            with mock.patch("src.validator.chat_structured", return_value=mock_intent):
+                from src.validator import extract_intent
+                result = extract_intent(None, "count rows in employees.csv")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.summary, "count rows")
+
+    def test_structured_extract_falls_back_on_exception(self):
+        import unittest.mock as mock
+        from src.validator import extract_intent
+        def mock_llm(msgs, use_tools=False, think=False):
+            return {"content": '{"summary": "test", "criteria": []}'}
+        with mock.patch.dict("os.environ", {"FOX_STRUCTURED_OUTPUT": "0"}):
+            result = extract_intent(mock_llm, "do something")
+        self.assertIsNotNone(result)
+
+    def test_criterion_imported_from_schemas(self):
+        from src.validator import Criterion
+        from src.schemas import Criterion as SchemaCriterion
+        self.assertIs(Criterion, SchemaCriterion)
+```
+
+**Note**: The `test_structured_extract_returns_intent` test patches `src.validator.FOX_STRUCTURED_OUTPUT_FLAG`. Implement this flag in `validator.py` as a module-level constant: `FOX_STRUCTURED_OUTPUT_FLAG = os.environ.get("FOX_STRUCTURED_OUTPUT", "1") == "1"` so tests can monkeypatch it.
+
+**Definition of Done**:
+- [ ] `Criterion` and `Intent` dataclasses removed from `validator.py`; imported from `src.schemas`
+- [ ] `extract_intent` uses `chat_structured` when `FOX_STRUCTURED_OUTPUT=1`
+- [ ] Falls back to legacy regex path on any exception
+- [ ] All existing `TestValidatorSemantic` and `TestValidateEndToEnd` tests still pass
+- [ ] 3 new tests in `TestStructuredIntent` pass
+- [ ] Commit: `"extract_intent uses chat_structured(Intent); Criterion/Intent moved to src.schemas"`
+
+---
+
+### Story 13.4 — `StepResult` structured output for subtask steps
+
+**As a** subtask executor
+**I want** each subtask's final response to be a `StepResult` JSON object
+**So that** `_verify_step` checks `result` and `files_created` directly without regex on the description.
+
+**Files to touch**: `src/mapreduce.py`
+
+**Update `_build_subtask_messages`** — change the OUTPUT FORMAT section in the user message:
+
+Replace:
+```
+OUTPUT FORMAT (mandatory last line):
+RESULT: <one-line summary of what you found or produced>
+```
+
+With (when `_STRUCTURED_OUTPUT=True`):
+```
+OUTPUT FORMAT — respond with a JSON object as your FINAL message:
+{
+  "result": "<one-line summary of what you found or produced>",
+  "files_created": ["path/to/file.txt"]   // empty list if no files written
+}
+Do NOT wrap in markdown fences. Output ONLY the JSON object as your last message.
+```
+
+**Update `_run_mapreduce`** — after each subtask completes, parse its result:
+
+```python
+from src.schemas import StepResult
+
+raw_result = sm.run(messages, self.llm_fn, self.command_registry, self.storage, self.session_id)
+
+if _STRUCTURED_OUTPUT:
+    try:
+        import json as _json
+        # The model's last message is JSON — extract it
+        m = re.search(r'\{.*\}', raw_result, re.DOTALL)
+        if m:
+            step_result = StepResult.model_validate_json(m.group(0))
+            extracted = step_result.result
+            created_files = step_result.files_created
+        else:
+            extracted = _extract_result(raw_result)  # fallback
+            created_files = []
+    except Exception:
+        extracted = _extract_result(raw_result)  # fallback
+        created_files = []
+else:
+    extracted = _extract_result(raw_result)
+    created_files = []
+```
+
+**Update `_verify_step`** — when `files_created` is provided, skip filename regex on description and check those paths directly:
+
+```python
+def _verify_step(
+    self, desc: str, result: str,
+    files_created: list[str] | None = None,
+) -> tuple[bool, str]:
+    ...
+    # If structured output provided explicit file list, check those paths
+    if files_created is not None:
+        for path in files_created:
+            if not os.path.exists(path) and not os.path.exists(os.path.join(self.work_dir, path)):
+                return False, f"expected file {path} not found"
+        return True, ""
+    # Legacy: regex on description (unchanged)
+    ...
+```
+
+**Tests to add** (`tests/test_unit.py`, class `TestStepResultParsing`):
+
+```python
+class TestStepResultParsing(unittest.TestCase):
+    def test_step_result_parsed_from_json(self):
+        from src.schemas import StepResult
+        raw = '{"result": "42 rows found", "files_created": []}'
+        sr = StepResult.model_validate_json(raw)
+        self.assertEqual(sr.result, "42 rows found")
+        self.assertEqual(sr.files_created, [])
+
+    def test_step_result_with_file(self):
+        from src.schemas import StepResult
+        raw = '{"result": "wrote report", "files_created": ["/tmp/report.txt"]}'
+        sr = StepResult.model_validate_json(raw)
+        self.assertEqual(sr.files_created[0], "/tmp/report.txt")
+
+    def test_verify_step_uses_files_created(self):
+        orch, wd = _make_orch_pair()
+        path = os.path.join(wd, "out.txt")
+        open(path, "w").write("content")
+        ok, reason = orch._verify_step("write something", "RESULT: done", files_created=[path])
+        self.assertTrue(ok)
+
+    def test_verify_step_fails_missing_file_from_list(self):
+        orch, wd = _make_orch_pair()
+        ok, reason = orch._verify_step("write something", "RESULT: done",
+                                        files_created=["/tmp/nonexistent_fox_test_123.txt"])
+        self.assertFalse(ok)
+        self.assertIn("not found", reason)
+```
+
+Add helper at module level in test file:
+```python
+def _make_orch_pair():
+    orch, wd, _ = _make_orchestrator([""])
+    return orch, wd
+```
+
+**Definition of Done**:
+- [ ] `_build_subtask_messages` emits JSON OUTPUT FORMAT when `_STRUCTURED_OUTPUT=True`
+- [ ] `_run_mapreduce` parses `StepResult` and passes `files_created` to `_verify_step`
+- [ ] `_verify_step` accepts optional `files_created` parameter; checks those paths directly
+- [ ] Legacy `_extract_result` / RESULT: line path preserved for `FOX_STRUCTURED_OUTPUT=0`
+- [ ] 4 unit tests in `TestStepResultParsing` pass
+- [ ] Existing `TestVerifyStep` tests still pass
+- [ ] Commit: `"StepResult JSON contract for subtask output; _verify_step uses files_created list"`
+
+---
+
+### Story 13.5 — OpenAI integration test: run `openafc_psd_diff` against GPT-4o-mini
+
+**As a** developer
+**I want** to run the existing `openafc_psd_diff` test case against OpenAI (GPT-4o-mini) with structured output enabled
+**So that** I can verify the structured output pipeline end-to-end on a model that reliably follows schemas.
+
+**Files to touch**: `tests/test_harness.py` (add new test runner target); no new files needed.
+
+**New CLI flag** in `test_harness.py`:
+
+```python
+# In the __main__ block at the bottom, add:
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--tests", nargs="*", help="Run only named tests")
+parser.add_argument("--backend", choices=["ollama", "openai"], default=None)
+args = parser.parse_args()
+
+if args.backend:
+    os.environ["FOX_BACKEND"] = args.backend
+    if args.backend == "openai" and not os.environ.get("OPENAI_API_KEY"):
+        print("ERROR: OPENAI_API_KEY not set")
+        sys.exit(1)
+
+tests_to_run = TESTS
+if args.tests:
+    tests_to_run = [t for t in TESTS if t.name in args.tests]
+```
+
+**Run command to validate**:
+```bash
+FOX_BACKEND=openai FOX_STRUCTURED_OUTPUT=1 OPENAI_API_KEY=<key> \
+    python3 tests/test_harness.py --tests openafc_psd_diff --backend openai
+```
+
+**Expected**: `openafc_psd_diff` passes with GPT-4o-mini + structured output. The model correctly identifies the WQPJ677/WQPJ679 callsign mismatch and reports both PSD and path loss deltas.
+
+**Also run the full Ollama suite** to confirm no regressions:
+```bash
+FOX_STRUCTURED_OUTPUT=1 python3 tests/test_harness.py
+```
+
+**Tests to add** (`tests/test_unit.py`, class `TestOpenAIIntegration`):
+
+```python
+class TestOpenAIIntegration(unittest.TestCase):
+    """Mocked OpenAI integration — no real API key needed for unit tests."""
+
+    def test_chat_structured_openai_plan(self):
+        import unittest.mock as mock
+        import json
+        import src.ollama as ol
+        ol.BACKEND = "openai"
+        ol.OPENAI_API_KEY = "test"
+        expected = {
+            "intent": "list python files",
+            "reasoning": "use list_files tool",
+            "steps": [{"tool": "list_files", "description": "list *.py files"}],
+        }
+        resp = mock.MagicMock()
+        resp.json.return_value = {"choices": [{"message": {"content": json.dumps(expected)}}]}
+        resp.raise_for_status = mock.MagicMock()
+        with mock.patch("src.ollama.requests.post", return_value=resp):
+            from src.ollama import chat_structured
+            from src.schemas import Plan
+            plan = chat_structured([{"role": "user", "content": "list py files"}], Plan)
+        self.assertEqual(plan.intent, "list python files")
+        self.assertEqual(plan.steps[0].tool, "list_files")
+
+    def test_openai_response_format_payload_shape(self):
+        """Verify the payload sent to OpenAI has the correct response_format structure."""
+        import unittest.mock as mock
+        import json
+        import src.ollama as ol
+        ol.BACKEND = "openai"
+        ol.OPENAI_API_KEY = "test"
+        resp = mock.MagicMock()
+        resp.json.return_value = {"choices": [{"message": {"content": '{"intent":"x","steps":[{"tool":"run_bash","description":"do x"}]}'}}]}
+        resp.raise_for_status = mock.MagicMock()
+        with mock.patch("src.ollama.requests.post", return_value=resp) as mock_post:
+            from src.ollama import chat_structured
+            from src.schemas import Plan
+            chat_structured([{"role": "user", "content": "x"}], Plan)
+        payload = mock_post.call_args[1]["json"]
+        self.assertIn("response_format", payload)
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertIn("schema", payload["response_format"]["json_schema"])
+```
+
+**Definition of Done**:
+- [ ] `test_harness.py` accepts `--tests` and `--backend` CLI args
+- [ ] `openafc_psd_diff` passes when run with `FOX_BACKEND=openai` and `FOX_STRUCTURED_OUTPUT=1`
+- [ ] All existing Ollama test cases still pass with `FOX_STRUCTURED_OUTPUT=1`
+- [ ] 2 mocked unit tests in `TestOpenAIIntegration` pass (no real API key needed)
+- [ ] Commit: `"OpenAI integration test for openafc_psd_diff; --backend CLI flag in test_harness"`
+
+---
+
+### Cross-cutting DoD for Epic 13
+
+- [ ] Stories implemented in order: 13.0 → 13.1 → 13.2 → 13.3 → 13.4 → 13.5
+- [ ] `pydantic>=2.0` in `requirements.txt`
+- [ ] `src/schemas.py` is the single source of truth — no duplicate `Criterion`/`Intent` dataclasses remain in `validator.py`
+- [ ] `FOX_STRUCTURED_OUTPUT=0` restores full legacy behaviour; all existing tests pass with it set to 0
+- [ ] `FOX_STRUCTURED_OUTPUT=1` (default) uses constrained decoding for plan + intent + step result
+- [ ] No story deletes the legacy CoT path — it stays as a fallback for models that degrade under grammar constraints
+- [ ] Every new story commits separately so regressions are bisect-able
+- [ ] `FOX_STRUCTURED_OUTPUT` documented in CLAUDE.md under "Configuration"

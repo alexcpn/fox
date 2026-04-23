@@ -361,14 +361,58 @@ class TestStorageSchema(unittest.TestCase):
         s.close()
 
 
+# ── Epic 13 Story 13.0 — Schema model tests ───────────────────────────────────
+
+class TestSchemas(unittest.TestCase):
+    def test_plan_step_rejects_unknown_tool(self):
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            PlanStep(tool="analyze_data", description="do something")
+
+    def test_plan_step_accepts_valid_tool(self):
+        s = PlanStep(tool="run_python", description="count rows in csv")
+        self.assertEqual(s.tool, "run_python")
+
+    def test_plan_requires_at_least_one_step(self):
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            Plan(intent="do something", steps=[])
+
+    def test_plan_rejects_too_many_steps(self):
+        from pydantic import ValidationError
+        steps = [PlanStep(tool="run_bash", description=f"step {i} here") for i in range(7)]
+        with self.assertRaises(ValidationError):
+            Plan(intent="do too much", steps=steps)
+
+    def test_intent_from_dict_roundtrip(self):
+        d = {"summary": "count rows", "criteria": [
+            {"type": "output_contains", "args": {"keywords": ["done"]}}
+        ]}
+        intent = Intent.from_dict(d)
+        self.assertEqual(intent.summary, "count rows")
+        self.assertEqual(intent.criteria[0].type, "output_contains")
+        self.assertEqual(intent.to_dict(), d)
+
+    def test_step_result_requires_nonempty_result(self):
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            StepResult(result="")
+
+    def test_step_result_files_created_defaults_empty(self):
+        sr = StepResult(result="42 rows found")
+        self.assertEqual(sr.files_created, [])
+
+
 # ── Epic 10 tests ─────────────────────────────────────────────────────────────
+
+from src.schemas import Plan, PlanStep, Intent, Criterion, StepResult
 
 from src.mapreduce import (
     MapReduceOrchestrator, _extract_result, _validate_plan_structural,
     _parse_intent_from_plan, _TOOL_NAMES,
 )
 from src.commands import CommandRegistry
-from src.states import TaskStateMachine
+from src.states import TaskStateMachine, _classify_failure
 
 
 def _make_orchestrator(llm_responses):
@@ -751,6 +795,16 @@ class TestDecompositionGate(unittest.TestCase):
                 mock_plan.assert_not_called()
                 mock_single.assert_called_once()
 
+    def test_explicit_single_run_python_skips_planner(self):
+        orch, _, _ = _make_orchestrator(["done"])
+        import unittest.mock as mock
+        prompt = "Do not decompose this task. Use exactly one run_python tool call."
+        with mock.patch.object(orch, "_run_single", return_value="ok") as mock_single:
+            with mock.patch.object(orch, "_map_phase") as mock_plan:
+                orch.execute(prompt, [])
+                mock_plan.assert_not_called()
+                mock_single.assert_called_once()
+
     def test_one_step_plan_runs_single(self):
         orch, _, _ = _make_orchestrator(["done"])
         import unittest.mock as mock
@@ -771,6 +825,213 @@ class TestDecompositionGate(unittest.TestCase):
                     orch.execute("count rows in employees.csv and summarize", [])
                     mock_mr.assert_called_once()
                     mock_single.assert_not_called()
+
+
+# ── Epic 12 tests ─────────────────────────────────────────────────────────────
+
+class TestFailureTaxonomy(unittest.TestCase):
+    """Story 12.1 — failure mode classification and persistence."""
+
+    def test_classify_failure_loop(self):
+        self.assertEqual(_classify_failure("loop detected: repeating same tool calls"), "loop_detected")
+
+    def test_classify_failure_max_turns(self):
+        self.assertEqual(_classify_failure("max turns reached"), "max_turns")
+
+    def test_classify_failure_empty_response(self):
+        self.assertEqual(_classify_failure("empty LLM response after nudges"), "empty_response")
+
+    def test_classify_failure_unknown_falls_back(self):
+        self.assertEqual(_classify_failure("something unexpected happened"), "tool_error")
+
+    def test_failure_mode_persisted(self):
+        wd = tempfile.mkdtemp()
+        storage = Storage(os.path.join(wd, "test.duckdb"))
+        storage.create_session("s1", "test", "/")
+        storage.create_task("t1", "s1", "test task")
+
+        def mock_llm(msgs, use_tools=False, think=False):
+            return {"role": "assistant", "content": ""}  # empty → nudge → fail
+
+        registry = CommandRegistry(wd, storage)
+        sm = TaskStateMachine(task_id="t1", description="test task", max_turns=1)
+        sm._empty_nudges = 3  # pre-trip the nudge counter
+        sm.run([{"role": "system", "content": "sys"}], mock_llm, registry, storage, "s1")
+
+        row = storage.conn.execute(
+            "SELECT failure_mode FROM tasks WHERE task_id='t1'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIsNotNone(row[0])
+
+
+class TestHarnessParamsStorage(unittest.TestCase):
+    """Story 12.2 — harness_params table and helper methods."""
+
+    def _make_storage(self):
+        wd = tempfile.mkdtemp()
+        s = Storage(os.path.join(wd, "test.duckdb"))
+        s.create_session("s1", "test", "/")
+        return s
+
+    def test_harness_params_table_exists(self):
+        s = self._make_storage()
+        tables = [r[0] for r in s.conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
+        ).fetchall()]
+        self.assertIn("harness_params", tables)
+        s.close()
+
+    def test_record_harness_outcome_new_entry(self):
+        s = self._make_storage()
+        s.record_harness_outcome("count lines in a file", max_turns=4, retry_start=0,
+                                  turns_used=3, success=True)
+        row = s.conn.execute("SELECT success_count, failure_count FROM harness_params").fetchone()
+        assert row is not None
+        self.assertEqual(row[0], 1)
+        self.assertEqual(row[1], 0)
+        s.close()
+
+    def test_record_harness_outcome_updates_counts(self):
+        s = self._make_storage()
+        desc = "count lines in a file"
+        s.record_harness_outcome(desc, max_turns=4, retry_start=0, turns_used=3, success=True)
+        s.record_harness_outcome(desc, max_turns=4, retry_start=0, turns_used=5, success=False)
+        row = s.conn.execute("SELECT success_count, failure_count FROM harness_params").fetchone()
+        assert row is not None
+        self.assertEqual(row[0], 1)
+        self.assertEqual(row[1], 1)
+        s.close()
+
+    def test_lookup_harness_params_returns_none_on_empty_db(self):
+        s = self._make_storage()
+        result = s.lookup_harness_params("count rows in employees.csv")
+        self.assertIsNone(result)
+        s.close()
+
+    def test_avg_turns_used_running_average(self):
+        s = self._make_storage()
+        desc = "count rows in a csv file"
+        s.record_harness_outcome(desc, max_turns=6, retry_start=0, turns_used=4, success=True)
+        s.record_harness_outcome(desc, max_turns=6, retry_start=0, turns_used=6, success=True)
+        s.record_harness_outcome(desc, max_turns=6, retry_start=0, turns_used=2, success=True)
+        row = s.conn.execute("SELECT avg_turns_used FROM harness_params").fetchone()
+        assert row is not None
+        self.assertAlmostEqual(row[0], 4.0, places=1)
+        s.close()
+
+
+class TestHarnessPriming(unittest.TestCase):
+    """Story 12.3 — harness priming and outcome recording."""
+
+    def _run_sm(self, storage, description="test task", max_turns=1, retry_level=0):
+        storage.create_task("t_prime", "s1", description)
+        messages = [{"role": "system", "content": "sys"}]
+
+        def mock_llm(msgs, use_tools=False, think=False):
+            return {"role": "assistant", "content": "done"}
+
+        wd = tempfile.mkdtemp()
+        registry = CommandRegistry(wd, storage)
+        sm = TaskStateMachine(
+            task_id="t_prime", description=description,
+            max_turns=max_turns, retry_level=retry_level,
+        )
+        sm.run(messages, mock_llm, registry, storage, "s1")
+        return messages, sm
+
+    def test_harness_primed_from_history(self):
+        import unittest.mock as mock
+        wd = tempfile.mkdtemp()
+        storage = Storage(os.path.join(wd, "test.duckdb"))
+        storage.create_session("s1", "test", "/")
+        hp = {"task_hash": "abc", "description": "test", "max_turns": 6,
+              "retry_start": 2, "success_count": 0, "failure_count": 3, "avg_turns_used": 5.5}
+        with mock.patch.object(storage, "lookup_harness_params", return_value=hp):
+            messages, sm = self._run_sm(storage, max_turns=4)
+        # retry_level should have been set to 2, causing the example hint to appear
+        contents = " ".join(m.get("content", "") for m in messages if m.get("role") == "system")
+        self.assertIn("Example tool call:", contents)
+
+    def test_harness_not_primed_on_none(self):
+        import unittest.mock as mock
+        wd = tempfile.mkdtemp()
+        storage = Storage(os.path.join(wd, "test.duckdb"))
+        storage.create_session("s1", "s1", "/")
+        with mock.patch.object(storage, "lookup_harness_params", return_value=None):
+            messages, sm = self._run_sm(storage)
+        # No priming hints injected
+        contents = " ".join(m.get("content", "") for m in messages if m.get("role") == "system")
+        self.assertNotIn("Example tool call:", contents)
+        self.assertNotIn("exact structure", contents)
+
+    def test_outcome_recorded_on_completion(self):
+        import unittest.mock as mock
+        wd = tempfile.mkdtemp()
+        storage = Storage(os.path.join(wd, "test.duckdb"))
+        storage.create_session("s1", "test", "/")
+        # max_turns=2: turn 1 → EXECUTING→EVALUATING, turn 2 → EVALUATING→COMPLETED
+        with mock.patch.object(storage, "record_harness_outcome") as mock_record:
+            self._run_sm(storage, max_turns=2)
+        mock_record.assert_called_once()
+        call = mock_record.call_args
+        success_val = call.kwargs.get("success", call.args[-1] if call.args else True)
+        self.assertTrue(success_val)
+
+    def test_outcome_recorded_on_failure(self):
+        import unittest.mock as mock
+        wd = tempfile.mkdtemp()
+        storage = Storage(os.path.join(wd, "test.duckdb"))
+        storage.create_session("s1", "test", "/")
+        storage.create_task("t_fail", "s1", "test task")
+        messages = [{"role": "system", "content": "sys"}]
+        registry = CommandRegistry(wd, storage)
+        sm = TaskStateMachine(task_id="t_fail", description="test task", max_turns=0)
+        with mock.patch.object(storage, "record_harness_outcome") as mock_record:
+            sm.run(messages, lambda *a, **kw: {"role": "assistant", "content": "x"},
+                   registry, storage, "s1")
+        mock_record.assert_called_once()
+
+
+class TestFailureModeHints(unittest.TestCase):
+    """Story 12.4 — failure-mode-aware hint injection."""
+
+    def _run_with_histogram(self, histogram):
+        import unittest.mock as mock
+        wd = tempfile.mkdtemp()
+        storage = Storage(os.path.join(wd, "test.duckdb"))
+        storage.create_session("s1", "test", "/")
+        storage.create_task("t_hint", "s1", "test task")
+        messages = [{"role": "system", "content": "sys"}]
+        registry = CommandRegistry(wd, storage)
+        sm = TaskStateMachine(task_id="t_hint", description="test task", max_turns=1)
+        with mock.patch.object(storage, "failure_histogram", return_value=histogram):
+            sm.run(messages, lambda *a, **kw: {"role": "assistant", "content": "done"},
+                   registry, storage, "s1")
+        return messages
+
+    def test_failure_hint_injected_for_loop(self):
+        msgs = self._run_with_histogram({"loop_detected": 3})
+        contents = " ".join(m.get("content", "") for m in msgs if m.get("role") == "system")
+        self.assertIn("Avoid repeating the same tool call", contents)
+
+    def test_failure_hint_not_injected_below_threshold(self):
+        msgs = self._run_with_histogram({"loop_detected": 1})
+        contents = " ".join(m.get("content", "") for m in msgs if m.get("role") == "system")
+        self.assertNotIn("Avoid repeating", contents)
+
+    def test_failure_hint_not_injected_unknown_mode(self):
+        # Unknown mode key — should not crash and no hint
+        msgs = self._run_with_histogram({"unknown_mode": 5})
+        contents = " ".join(m.get("content", "") for m in msgs if m.get("role") == "system")
+        self.assertNotIn("Avoid repeating", contents)
+
+    def test_failure_hint_picks_dominant(self):
+        msgs = self._run_with_histogram({"max_turns": 2, "loop_detected": 5})
+        contents = " ".join(m.get("content", "") for m in msgs if m.get("role") == "system")
+        # loop_detected (5) beats max_turns (2) — loop hint should appear
+        self.assertIn("Avoid repeating the same tool call", contents)
+        self.assertNotIn("Be efficient", contents)
 
 
 if __name__ == "__main__":
