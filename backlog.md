@@ -1245,7 +1245,7 @@ Same as Epic 10, plus:
 
 ---
 
-## Epic 12 — Harness Self-Adaptation (Behavioural RLMF)
+## Epic 12 — Harness Self-Adaptation (Behavioural RLMF) ✅ DONE
 
 **Goal**: Fox learns from its own execution history — not by updating model weights, but by adapting harness parameters (max_turns, retry_level starting point, hint strategy) based on what worked and what failed for similar tasks in the past.
 
@@ -1459,7 +1459,7 @@ except Exception:
 
 ---
 
-## Epic 13 — Pydantic Structured Output + OpenAI Backend Validation
+## Epic 13 — Pydantic Structured Output + OpenAI Backend Validation ✅ DONE
 
 **Goal**: Replace all regex-based LLM output parsing with Pydantic schema-constrained calls. The LLM physically cannot produce a malformed plan or intent — the grammar or response_format contract enforces structure at the token level. Validate the implementation against OpenAI's structured outputs API as a correctness benchmark.
 
