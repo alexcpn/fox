@@ -8,8 +8,15 @@ import glob
 import json
 import os
 import re
-from dataclasses import dataclass, field
 from typing import Optional
+
+# Criterion and Intent are now Pydantic models (single source of truth in src.schemas)
+from src.schemas import Criterion, Intent
+
+try:
+    from src.ollama import chat_structured
+except ImportError:
+    chat_structured = None  # type: ignore[assignment]
 
 
 # ── Magic bytes for format validation ─────────────────────────────────────────
@@ -26,36 +33,8 @@ _MAGIC: dict[str, bytes] = {
     "gif":  b"GIF8",
 }
 
-
-# ── Data structures ───────────────────────────────────────────────────────────
-
-@dataclass
-class Criterion:
-    type: str
-    args: dict = field(default_factory=dict)
-
-
-@dataclass
-class Intent:
-    summary: str = ""
-    criteria: list[Criterion] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        return {
-            "summary": self.summary,
-            "criteria": [{"type": c.type, "args": c.args} for c in self.criteria],
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "Intent":
-        return cls(
-            summary=d.get("summary", ""),
-            criteria=[
-                Criterion(type=c["type"], args=c.get("args", {}))
-                for c in d.get("criteria", [])
-                if "type" in c
-            ],
-        )
+# Structured output flag — checked at call time so tests can patch os.environ
+FOX_STRUCTURED_OUTPUT_FLAG = os.environ.get("FOX_STRUCTURED_OUTPUT", "1") == "1"
 
 
 # ── Extraction ────────────────────────────────────────────────────────────────
@@ -90,19 +69,27 @@ Rules:
 
 def extract_intent(llm_fn, user_input: str) -> Optional[Intent]:
     """Single LLM call. Returns None on parse failure (skip validation)."""
+    messages = [
+        {"role": "system", "content": _EXTRACT_SYSTEM},
+        {"role": "user",   "content": user_input},
+    ]
+
+    # Structured path — grammar-constrained, returns validated Intent directly
+    if FOX_STRUCTURED_OUTPUT_FLAG and chat_structured is not None:
+        try:
+            return chat_structured(messages, Intent, think=False)
+        except Exception:
+            pass  # fall through to legacy regex path
+
+    # Legacy regex path (fallback)
     try:
         response = llm_fn(
-            [
-                {"role": "system", "content": _EXTRACT_SYSTEM},
-                {"role": "user", "content": user_input},
-            ],
+            messages,
             use_tools=False, think=False,
         )
         content = (response.get("content") or "").strip()
-        # Strip markdown fences the model often adds despite instructions
         content = re.sub(r'^```(?:json)?\s*', '', content)
         content = re.sub(r'\s*```$', '', content)
-        # Grab the first JSON object if there's trailing prose
         m = re.search(r'\{.*\}', content, re.DOTALL)
         if not m:
             return None

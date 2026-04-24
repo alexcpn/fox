@@ -45,12 +45,17 @@ class Storage:
                 completed_at DOUBLE,
                 result       VARCHAR,
                 error        VARCHAR,
-                intent_json  VARCHAR
+                intent_json  VARCHAR,
+                failure_mode VARCHAR
             )
         """)
-        # Backfill intent_json column if upgrading from an older schema
+        # Backfill columns when upgrading from an older schema
         try:
             self.conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS intent_json VARCHAR")
+        except Exception:
+            pass
+        try:
+            self.conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS failure_mode VARCHAR")
         except Exception:
             pass
         self.conn.execute("""
@@ -120,6 +125,19 @@ class Storage:
                 completed_at DOUBLE
             )
         """)
+        # Learned harness parameters per task type
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS harness_params (
+                task_hash      VARCHAR PRIMARY KEY,
+                description    VARCHAR,
+                max_turns      INTEGER,
+                retry_start    INTEGER,
+                success_count  INTEGER DEFAULT 0,
+                failure_count  INTEGER DEFAULT 0,
+                avg_turns_used DOUBLE  DEFAULT 0.0,
+                updated_at     DOUBLE
+            )
+        """)
 
     # ── Sessions ─────────────────────────────────────────────────────────────
 
@@ -156,11 +174,12 @@ class Storage:
         state: str,
         result: Optional[str] = None,
         error: Optional[str] = None,
+        failure_mode: Optional[str] = None,
     ):
         if state in ("COMPLETED", "FAILED"):
             self.conn.execute(
-                "UPDATE tasks SET state=?, completed_at=?, result=?, error=? WHERE task_id=?",
-                [state, time.time(), result, error, task_id],
+                "UPDATE tasks SET state=?, completed_at=?, result=?, error=?, failure_mode=? WHERE task_id=?",
+                [state, time.time(), result, error, failure_mode, task_id],
             )
         else:
             self.conn.execute(
@@ -447,6 +466,90 @@ class Storage:
                 "score": round(score, 4),
             })
         return results
+
+    # ── Harness adaptation (Epic 12) ──────────────────────────────────────────
+
+    def record_harness_outcome(
+        self,
+        description: str,
+        max_turns: int,
+        retry_start: int,
+        turns_used: int,
+        success: bool,
+    ):
+        task_hash = hashlib.sha256(description[:80].lower().strip().encode()).hexdigest()[:16]
+        existing = self.conn.execute(
+            "SELECT success_count, failure_count, avg_turns_used FROM harness_params WHERE task_hash=?",
+            [task_hash],
+        ).fetchone()
+        now = time.time()
+        if existing:
+            sc, fc, avg = existing
+            total = sc + fc
+            new_sc = sc + (1 if success else 0)
+            new_fc = fc + (0 if success else 1)
+            new_avg = ((avg * total) + turns_used) / (total + 1)
+            self.conn.execute(
+                "UPDATE harness_params SET success_count=?, failure_count=?, avg_turns_used=?, "
+                "max_turns=?, retry_start=?, updated_at=? WHERE task_hash=?",
+                [new_sc, new_fc, new_avg, max_turns, retry_start, now, task_hash],
+            )
+        else:
+            self.conn.execute(
+                "INSERT INTO harness_params (task_hash, description, max_turns, retry_start, "
+                "success_count, failure_count, avg_turns_used, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                [task_hash, description[:200], max_turns, retry_start,
+                 1 if success else 0, 0 if success else 1, float(turns_used), now],
+            )
+
+    def lookup_harness_params(self, description: str) -> Optional[dict]:
+        rows = self.conn.execute(
+            "SELECT task_hash, description, max_turns, retry_start, "
+            "success_count, failure_count, avg_turns_used "
+            "FROM harness_params ORDER BY updated_at DESC LIMIT 200"
+        ).fetchall()
+        if not rows:
+            return None
+        try:
+            from src.relevance import TFIDFIndex
+        except ImportError:
+            return None
+        idx = TFIDFIndex()
+        for row in rows:
+            idx.add_document(row[0], row[1])
+        scores = dict(idx.score(description))
+        best = max(rows, key=lambda r: scores.get(r[0], 0.0))
+        if scores.get(best[0], 0.0) < 0.15:
+            return None
+        cols = ["task_hash", "description", "max_turns", "retry_start",
+                "success_count", "failure_count", "avg_turns_used"]
+        return dict(zip(cols, best))
+
+    def failure_histogram(self, description: str, limit: int = 20) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT description, failure_mode FROM tasks "
+            "WHERE state='FAILED' AND failure_mode IS NOT NULL "
+            "ORDER BY completed_at DESC LIMIT ?",
+            [limit * 5],
+        ).fetchall()
+        if not rows:
+            return {}
+        try:
+            from src.relevance import TFIDFIndex
+        except ImportError:
+            hist: dict = {}
+            for _, mode in rows[:limit]:
+                hist[mode] = hist.get(mode, 0) + 1
+            return hist
+        idx = TFIDFIndex()
+        for i, (desc, _) in enumerate(rows):
+            idx.add_document(str(i), desc)
+        scores = dict(idx.score(description))
+        hist = {}
+        for i, (_, mode) in enumerate(rows):
+            if scores.get(str(i), 0.0) > 0.05:
+                hist[mode] = hist.get(mode, 0) + 1
+        return hist
 
     # ── Startup GC ────────────────────────────────────────────────────────────
 

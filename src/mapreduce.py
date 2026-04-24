@@ -16,8 +16,8 @@ from src.states import TaskStateMachine
 from src.storage import Storage
 from src.commands import CommandRegistry
 from src.ollama import build_system_prompt, chat_structured
-from src.schemas import Plan, PlanStep, Intent as SchemaIntent, StepResult
-from src.validator import extract_intent, validate, Intent
+from src.schemas import Plan, PlanStep, Intent, StepResult
+from src.validator import extract_intent, validate
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -271,8 +271,24 @@ class MapReduceOrchestrator:
             )
             self.storage.update_task_state(sub_id, sm.state.value, result=result)
 
+            # Parse StepResult JSON when structured output is on
+            files_created: Optional[list] = None
+            if _STRUCTURED_OUTPUT:
+                try:
+                    m = re.search(r'\{.*\}', result, re.DOTALL)
+                    if m:
+                        step_result = StepResult.model_validate_json(m.group(0))
+                        extracted = step_result.result
+                        files_created = step_result.files_created
+                    else:
+                        extracted = _extract_result(result)
+                except Exception:
+                    extracted = _extract_result(result)
+            else:
+                extracted = _extract_result(result)
+
             # Per-step structural verification; one retry on failure
-            ok, reason = self._verify_step(desc, result)
+            ok, reason = self._verify_step(desc, result, files_created=files_created)
             if not ok:
                 print(f"  \033[33m  ⚠ step {i+1} verify failed: {reason} — retrying\033[0m")
                 retry_id = f"{sub_id}-retry"
@@ -291,8 +307,21 @@ class MapReduceOrchestrator:
                 result = retry_sm.run(
                     retry_messages, self.llm_fn, self.command_registry, self.storage, self.session_id
                 )
+                # Re-extract after retry
+                if _STRUCTURED_OUTPUT:
+                    try:
+                        m2 = re.search(r'\{.*\}', result, re.DOTALL)
+                        if m2:
+                            sr2 = StepResult.model_validate_json(m2.group(0))
+                            extracted = sr2.result
+                        else:
+                            extracted = _extract_result(result)
+                    except Exception:
+                        extracted = _extract_result(result)
+                else:
+                    extracted = _extract_result(result)
 
-            extracted = _extract_result(result)
+            # `extracted` already set above — don't re-assign
             result_values.append(extracted)
             subtask_results.append(
                 f"Subtask {i+1} ({desc}):\nRESULT: {extracted}\n(full output below)\n{result[:400]}"
@@ -508,6 +537,21 @@ class MapReduceOrchestrator:
         system = build_system_prompt(self.work_dir)
         data_ref = data_file or "(no data file)"
         plan_ref = f"Full plan is at {plan_path}." if plan_path else ""
+        if _STRUCTURED_OUTPUT:
+            output_format = (
+                "OUTPUT FORMAT — your FINAL message must be a JSON object only:\n"
+                '{"result": "<one-line answer>", "files_created": ["path/to/file"]}\n'
+                "Use empty list for files_created if no files were written.\n"
+                "Do NOT wrap in markdown fences. Output ONLY the JSON as your last message."
+            )
+        else:
+            output_format = (
+                "OUTPUT FORMAT:\n"
+                "Your final message MUST end with exactly one line:\n"
+                "  RESULT: <value>\n"
+                "Where <value> is the direct answer to this step.\n"
+                "Do not add text after the RESULT line."
+            )
         user_content = (
             f"You are step {step_index} of {total_steps}. {plan_ref}\n\n"
             f"TASK: {description}\n\n"
@@ -519,11 +563,7 @@ class MapReduceOrchestrator:
             f"- Do NOT hardcode values. Parse from the file.\n"
             f"- Call exactly ONE tool. Print the result. Then stop.\n"
             f"- Print your results with print().\n\n"
-            f"OUTPUT FORMAT:\n"
-            f"Your final message MUST end with exactly one line:\n"
-            f"  RESULT: <value>\n"
-            f"Where <value> is the direct answer to this step (a number, filename, short string, or 'done').\n"
-            f"Do not add text after the RESULT line."
+            f"{output_format}"
         )
         return [
             {"role": "system", "content": system},
@@ -569,15 +609,31 @@ class MapReduceOrchestrator:
         response = self.llm_fn(synth_messages, use_tools=False, think=False)
         return response.get("content", "(no synthesis)")
 
-    def _verify_step(self, desc: str, result: str) -> tuple:
+    def _verify_step(
+        self,
+        desc: str,
+        result: str,
+        files_created: Optional[list] = None,
+    ) -> tuple:
         """
         Structural check only — no LLM judge.
-        Returns (ok, reason). Checks for RESULT: line and expected file side-effects.
+        Returns (ok, reason).
+
+        When files_created is provided (from StepResult JSON), check those exact
+        paths instead of regex-guessing filenames from the description.
         """
+        # Structured path: explicit file list from StepResult
+        if files_created is not None:
+            for path in files_created:
+                if not os.path.exists(path) and not os.path.exists(
+                    os.path.join(self.work_dir, path)
+                ):
+                    return False, f"expected file {path} not found"
+            return True, ""
+
+        # Legacy path: check RESULT: line then regex on description
         if not _RESULT_RE.search(result or ""):
             return False, "output missing 'RESULT:' line"
-        # If step mentions a write-type action + a filename, check the file exists.
-        # No trailing \b so write_file also triggers the check.
         if re.search(r'(write_file|write|create|save|generate)', desc, re.I):
             paths = re.findall(
                 r'([\w./-]+\.(?:py|txt|csv|md|json|html|pptx|xlsx|pdf|png))', desc

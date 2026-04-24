@@ -35,6 +35,41 @@ TRANSITIONS: dict[TaskState, set[TaskState]] = {
 
 TERMINAL = {TaskState.COMPLETED, TaskState.FAILED}
 
+# ── Failure classification (Epic 12) ──────────────────────────────────────────
+
+_FAILURE_MODES = {
+    "loop detected":      "loop_detected",
+    "max turns":          "max_turns",
+    "empty llm response": "empty_response",
+    "llm error":          "llm_error",
+}
+
+def _classify_failure(reason: str) -> str:
+    r = reason.lower()
+    for keyword, mode in _FAILURE_MODES.items():
+        if keyword in r:
+            return mode
+    return "tool_error"
+
+_FAILURE_HINTS: dict = {
+    "loop_detected": (
+        "Avoid repeating the same tool call. If you already read a file, "
+        "do not read it again — use the result you already have."
+    ),
+    "bad_format": (
+        "End your response with a line starting with RESULT: "
+        "followed by your answer. Example: RESULT: 42 records found."
+    ),
+    "empty_response": (
+        "You must respond with either a tool call or a final answer. "
+        "Do not return an empty response."
+    ),
+    "max_turns": (
+        "Be efficient. Combine steps where possible. "
+        "Aim to finish within 3 tool calls."
+    ),
+}
+
 
 # ── Transition record ─────────────────────────────────────────────────────────
 
@@ -90,7 +125,10 @@ class TaskStateMachine:
         self.error = reason
         self.transition(TaskState.FAILED, reason, storage)
         if storage:
-            storage.update_task_state(self.task_id, "FAILED", error=reason)
+            storage.update_task_state(
+                self.task_id, "FAILED", error=reason,
+                failure_mode=_classify_failure(reason),
+            )
 
     # ── Core loop ─────────────────────────────────────────────────────────────
 
@@ -128,6 +166,32 @@ class TaskStateMachine:
                 print(f"  \033[36m📋 playbook injected (score={chain['score']})\033[0m")
         except Exception:
             pass  # never block task execution for playbook lookup
+
+        # Harness parameter priming from past similar tasks (Epic 12.3)
+        try:
+            hp = storage.lookup_harness_params(self.description)
+            if hp:
+                primed = False
+                if hp["failure_count"] > hp["success_count"] and hp["avg_turns_used"] >= self.max_turns - 1:
+                    self.max_turns = min(self.max_turns + 2, 12)
+                    primed = True
+                if hp.get("retry_start", 0) > 0 and self.retry_level == 0:
+                    self.retry_level = hp["retry_start"]
+                    primed = True
+                if primed:
+                    print(f"  \033[33m⚙  harness primed: max_turns={self.max_turns} retry_level={self.retry_level} (from history)\033[0m")
+        except Exception:
+            pass  # never block task execution for harness lookup
+
+        # Failure-mode-aware hint injection (Epic 12.4)
+        try:
+            hist: dict[str, int] = storage.failure_histogram(self.description)
+            dominant = max(hist, key=lambda k: hist[k]) if hist else None
+            if dominant and hist[dominant] >= 2 and dominant in _FAILURE_HINTS:
+                messages.append({"role": "system", "content": _FAILURE_HINTS[dominant]})
+                print(f"  \033[33m⚠  failure hint injected: {dominant} (seen {hist[dominant]}x)\033[0m")
+        except Exception:
+            pass  # never block task execution for failure hint lookup
 
         # Progressive hint injection for retried subtasks (retry_level set by orchestrator)
         if self.retry_level >= 3:
@@ -260,6 +324,18 @@ class TaskStateMachine:
         # Max turns exceeded
         if not self.is_terminal:
             self._fail("max turns reached", storage)
+
+        # Record outcome for future harness adaptation (Epic 12.3)
+        try:
+            storage.record_harness_outcome(
+                self.description,
+                max_turns=self.max_turns,
+                retry_start=self.retry_level,
+                turns_used=self.turn_count,
+                success=self.state == TaskState.COMPLETED,
+            )
+        except Exception:
+            pass
 
         return self.result or self.error or "(no response)"
 

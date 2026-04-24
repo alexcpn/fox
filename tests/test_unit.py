@@ -720,8 +720,13 @@ class TestSubtaskMessages(unittest.TestCase):
         orch, wd = self._make_orch()
         msgs = orch._build_subtask_messages("run_bash ls", None, "/tmp/prev.txt", 1, 3)
         user_msg = msgs[1]["content"]
-        self.assertIn("RESULT:", user_msg)
         self.assertIn("OUTPUT FORMAT", user_msg)
+        # structured output is on by default — expect JSON format, not RESULT: line
+        import src.mapreduce as mr
+        if mr._STRUCTURED_OUTPUT:
+            self.assertIn('"result"', user_msg)
+        else:
+            self.assertIn("RESULT:", user_msg)
 
     def test_step_position_present(self):
         orch, wd = self._make_orch()
@@ -942,6 +947,118 @@ class TestStructuredMapPhase(unittest.TestCase):
                 intent, subtasks = orch._map_phase("ls")
                 mock_cs.assert_not_called()
         self.assertGreater(len(subtasks), 0)
+
+
+# ── Epic 13 Story 13.3 — structured extract_intent ────────────────────────────
+
+class TestStructuredIntent(unittest.TestCase):
+    def test_structured_extract_returns_intent(self):
+        import unittest.mock as mock
+        mock_intent = Intent(
+            summary="count rows",
+            criteria=[Criterion(type="output_contains", args={"keywords": ["done"]})]
+        )
+        with mock.patch.dict("os.environ", {"FOX_STRUCTURED_OUTPUT": "1"}):
+            with mock.patch("src.validator.chat_structured", return_value=mock_intent):
+                from src.validator import extract_intent
+                result = extract_intent(None, "count rows in employees.csv")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.summary, "count rows")
+
+    def test_structured_extract_falls_back_on_exception(self):
+        import unittest.mock as mock
+        def mock_llm(msgs, use_tools=False, think=False):
+            return {"content": '{"summary": "test", "criteria": []}'}
+        with mock.patch("src.validator.FOX_STRUCTURED_OUTPUT_FLAG", False):
+            from src.validator import extract_intent
+            result = extract_intent(mock_llm, "do something")
+        self.assertIsNotNone(result)
+
+    def test_criterion_imported_from_schemas(self):
+        from src.validator import Criterion as VCrit
+        self.assertIs(VCrit, Criterion)
+
+
+# ── Epic 13 Story 13.4 — StepResult parsing ───────────────────────────────────
+
+def _make_orch_pair():
+    orch, wd, _ = _make_orchestrator([""])
+    return orch, wd
+
+
+class TestStepResultParsing(unittest.TestCase):
+    def test_step_result_parsed_from_json(self):
+        raw = '{"result": "42 rows found", "files_created": []}'
+        sr = StepResult.model_validate_json(raw)
+        self.assertEqual(sr.result, "42 rows found")
+        self.assertEqual(sr.files_created, [])
+
+    def test_step_result_with_file(self):
+        raw = '{"result": "wrote report", "files_created": ["/tmp/report.txt"]}'
+        sr = StepResult.model_validate_json(raw)
+        self.assertEqual(sr.files_created[0], "/tmp/report.txt")
+
+    def test_verify_step_uses_files_created(self):
+        orch, wd = _make_orch_pair()
+        path = os.path.join(wd, "out.txt")
+        with open(path, "w") as f:
+            f.write("content")
+        ok, reason = orch._verify_step("write something", "RESULT: done", files_created=[path])
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+
+    def test_verify_step_fails_missing_file_from_list(self):
+        orch, wd = _make_orch_pair()
+        ok, reason = orch._verify_step(
+            "write something", "RESULT: done",
+            files_created=["/tmp/nonexistent_fox_test_xyz_12345.txt"]
+        )
+        self.assertFalse(ok)
+        self.assertIn("not found", reason)
+
+    def test_verify_step_empty_files_created_passes(self):
+        orch, _ = _make_orch_pair()
+        ok, reason = orch._verify_step("run_python count rows", "done", files_created=[])
+        self.assertTrue(ok)
+
+
+# ── Epic 13 Story 13.5 — OpenAI integration (mocked) ─────────────────────────
+
+class TestOpenAIIntegration(unittest.TestCase):
+    def test_chat_structured_openai_plan(self):
+        import unittest.mock as mock
+        import src.ollama as ol
+        ol.BACKEND = "openai"
+        ol.OPENAI_API_KEY = "test"
+        expected = {
+            "intent": "list python files in directory",
+            "reasoning": "use list_files tool",
+            "steps": [{"tool": "list_files", "description": "list *.py files in cwd"}],
+        }
+        resp = mock.MagicMock()
+        resp.json.return_value = {"choices": [{"message": {"content": json.dumps(expected)}}]}
+        resp.raise_for_status = mock.MagicMock()
+        with mock.patch("src.ollama.requests.post", return_value=resp):
+            from src.ollama import chat_structured
+            plan = chat_structured([{"role": "user", "content": "list py files"}], Plan)
+        self.assertEqual(plan.intent, "list python files in directory")
+        self.assertEqual(plan.steps[0].tool, "list_files")
+
+    def test_openai_response_format_payload_shape(self):
+        import unittest.mock as mock
+        import src.ollama as ol
+        ol.BACKEND = "openai"
+        ol.OPENAI_API_KEY = "test"
+        resp = mock.MagicMock()
+        resp.json.return_value = {"choices": [{"message": {"content": '{"intent":"list files now","steps":[{"tool":"run_bash","description":"do ls here"}]}'}}]}
+        resp.raise_for_status = mock.MagicMock()
+        with mock.patch("src.ollama.requests.post", return_value=resp) as mock_post:
+            from src.ollama import chat_structured
+            chat_structured([{"role": "user", "content": "x"}], Plan)
+        payload = mock_post.call_args[1]["json"]
+        self.assertIn("response_format", payload)
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertIn("schema", payload["response_format"]["json_schema"])
 
 
 # ── Epic 12 tests ─────────────────────────────────────────────────────────────
